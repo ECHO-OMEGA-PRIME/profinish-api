@@ -45,9 +45,13 @@ function requireAuth(c: any): Response | null {
   // Check Firebase token
   const user = verifyFirebaseAuth(c.req.raw, 'echo-prime-ai');
   if (user) {
-    const ownerEmail = c.env.OWNER_EMAIL || 'adam@profinishusa.com';
+    const ownerEmails = [
+      c.env.OWNER_EMAIL || 'adam@profinishusa.com',
+      'traxtoolandpro@gmail.com',
+      'adam@profinishusa.com'
+    ];
     const devEmails = ['bmcii1976@gmail.com'];
-    if (user.email === ownerEmail || devEmails.includes(user.email)) {
+    if (ownerEmails.includes(user.email) || devEmails.includes(user.email)) {
       return null; // Authorized
     }
     return c.json({ error: 'Forbidden — owner/dev access required' }, 403);
@@ -104,9 +108,9 @@ app.post('/customers', async (c) => {
   const id = uid();
   const refCode = 'PF' + id.slice(0, 6).toUpperCase();
   await c.env.DB.prepare(
-    'INSERT INTO customers (id, firebase_uid, name, email, phone, address, city, is_owner, referral_code, referred_by, preferred_language) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    'INSERT INTO customers (id, firebase_uid, name, email, phone, address, city, is_owner, referral_code, referred_by, preferred_language, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ).bind(id, body.firebase_uid || null, sanitize(body.name), sanitize(body.email || ''), sanitize(body.phone || ''), sanitize(body.address || ''), sanitize(body.city || ''),
-    body.email === c.env.OWNER_EMAIL ? 1 : 0, refCode, body.referred_by || null, body.preferred_language || 'en'
+    body.email === c.env.OWNER_EMAIL ? 1 : 0, refCode, body.referred_by || null, body.preferred_language || 'en', sanitize(body.notes || '')
   ).run();
   return c.json({ id, referral_code: refCode, is_owner: body.email === c.env.OWNER_EMAIL ? 1 : 0 });
 });
@@ -115,7 +119,7 @@ app.put('/customers/:id', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const body = await c.req.json();
-  const fields = ['name', 'email', 'phone', 'address', 'city', 'preferred_language'].filter(f => body[f] !== undefined);
+  const fields = ['name', 'email', 'phone', 'address', 'city', 'preferred_language', 'notes'].filter(f => body[f] !== undefined);
   if (!fields.length) return c.json({ error: 'No fields to update' }, 400);
   const sets = fields.map(f => `${f} = ?`).join(', ');
   const vals = fields.map(f => sanitize(body[f]));

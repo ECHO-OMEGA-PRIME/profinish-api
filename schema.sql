@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS customers (
   referral_code TEXT UNIQUE,
   referred_by TEXT,
   preferred_language TEXT DEFAULT 'en',
+  notes TEXT,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -50,11 +51,28 @@ CREATE TABLE IF NOT EXISTS invoices (
   tax_rate REAL DEFAULT 0.0825,
   tax_amount REAL DEFAULT 0,
   total REAL DEFAULT 0,
+  amount_paid REAL DEFAULT 0,
   due_date TEXT,
+  issue_date TEXT DEFAULT (date('now')),
   paid_date TEXT,
+  payment_terms TEXT DEFAULT 'net_30',
+  sales_rep TEXT,
+  share_token TEXT,
   notes TEXT,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id TEXT PRIMARY KEY,
+  invoice_id TEXT REFERENCES invoices(id),
+  amount REAL NOT NULL,
+  method TEXT DEFAULT 'check',
+  reference_number TEXT,
+  payment_date TEXT DEFAULT (date('now')),
+  collected_by TEXT,
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS invoice_items (
