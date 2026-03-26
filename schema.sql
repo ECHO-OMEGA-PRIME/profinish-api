@@ -314,6 +314,31 @@ INSERT OR IGNORE INTO subscriptions (id, service_name, provider, monthly_cost, c
   ('sub_elevenlabs', 'Voice (Belle TTS)', 'ElevenLabs', 5.00, 'ai', 'planned', 'Starter plan for Nova voice'),
   ('sub_openweather', 'Weather Data', 'NWS/OpenWeather', 0.00, 'data', 'active', 'Free — National Weather Service API');
 
+-- Document Delivery System
+CREATE TABLE IF NOT EXISTS document_deliveries (
+  id TEXT PRIMARY KEY,
+  doc_type TEXT NOT NULL DEFAULT 'INVOICE',
+  doc_number TEXT,
+  source_id TEXT,
+  customer_name TEXT,
+  customer_email TEXT,
+  customer_phone TEXT,
+  r2_key TEXT,
+  view_token TEXT UNIQUE,
+  total REAL DEFAULT 0,
+  delivery_channel TEXT,
+  delivery_status TEXT DEFAULT 'generated',
+  delivered_to TEXT,
+  delivered_at TEXT,
+  last_viewed_at TEXT,
+  view_count INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_doc_deliveries_token ON document_deliveries(view_token);
+CREATE INDEX IF NOT EXISTS idx_doc_deliveries_type ON document_deliveries(doc_type);
+CREATE INDEX IF NOT EXISTS idx_doc_deliveries_source ON document_deliveries(source_id);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_jobs_customer ON jobs(customer_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);

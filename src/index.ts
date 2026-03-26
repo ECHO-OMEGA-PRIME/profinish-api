@@ -16,6 +16,11 @@ type Env = {
   ZOHO_SMTP_PASS?: string;
   OPENAI_API_KEY?: string;
   AZURE_OPENAI_KEY?: string;
+  RESEND_API_KEY?: string;
+  COMPANY_NAME?: string;
+  COMPANY_PHONE?: string;
+  COMPANY_EMAIL?: string;
+  COMPANY_TAGLINE?: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -1179,6 +1184,627 @@ app.post('/belle/vision', async (c) => {
   } catch (e: any) {
     return c.json({ error: 'Vision failed', detail: e.message }, 500);
   }
+});
+
+// ═══════════════════════════════════════════════════════════
+// ─── UNIVERSAL DOCUMENT DELIVERY SYSTEM ──────────────────
+// Print, PDF, Email, SMS — fully self-contained
+// ═══════════════════════════════════════════════════════════
+
+// ─── Server-side Branded Document Builder ────────────────
+function buildDocumentHTML(opts: {
+  type: 'ESTIMATE' | 'INVOICE' | 'WORK_ORDER' | 'RECEIPT' | 'STATEMENT';
+  docNumber: string;
+  date: string;
+  dueDate?: string;
+  serviceDate?: string;
+  customerName: string;
+  customerEmail?: string;
+  customerPhone?: string;
+  customerAddress?: string;
+  jobTitle?: string;
+  serviceType?: string;
+  items: Array<{ description: string; qty: number; rate: number; amount: number }>;
+  subtotal: number;
+  taxRate: number;
+  taxAmount: number;
+  total: number;
+  amountPaid?: number;
+  scopeItems?: string[];
+  notes?: string;
+  paymentTerms?: string;
+  company: {
+    name: string;
+    phone: string;
+    email: string;
+    tagline: string;
+    website: string;
+    city: string;
+    primaryColor: string;
+    accentColor: string;
+  };
+}): string {
+  const co = opts.company;
+  const isEst = opts.type === 'ESTIMATE';
+  const isWO = opts.type === 'WORK_ORDER';
+  const isReceipt = opts.type === 'RECEIPT';
+  const isStatement = opts.type === 'STATEMENT';
+  const badgeBg = isEst ? '#22C55E' : isWO ? '#F59E0B' : isReceipt ? '#8B5CF6' : isStatement ? '#6366F1' : '#3B82F6';
+  const typeLabel = opts.type.replace('_', ' ');
+  const esc = (s: string) => (s || '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c] || c));
+
+  const lineRows = opts.items.map(i =>
+    `<tr><td style="padding:10px 16px;border-bottom:1px solid #E5E7EB;font-size:13px">${esc(i.description)}</td>` +
+    `<td style="padding:10px 16px;border-bottom:1px solid #E5E7EB;text-align:center;font-size:13px">${i.qty}</td>` +
+    `<td style="padding:10px 16px;border-bottom:1px solid #E5E7EB;text-align:right;font-size:13px">$${(i.rate||0).toFixed(2)}</td>` +
+    `<td style="padding:10px 16px;border-bottom:1px solid #E5E7EB;text-align:right;font-size:13px;font-weight:600">$${(i.amount||0).toFixed(2)}</td></tr>`
+  ).join('');
+
+  const subtotalRow = `<tr><td colspan="3" style="padding:10px 16px;text-align:right;font-weight:600;border-top:2px solid #D1D5DB">Subtotal</td>` +
+    `<td style="padding:10px 16px;text-align:right;font-weight:600;border-top:2px solid #D1D5DB">$${opts.subtotal.toFixed(2)}</td></tr>`;
+  const taxRow = opts.taxAmount > 0 ? `<tr><td colspan="3" style="padding:6px 16px;text-align:right;font-size:12px;color:#6B7280">Tax (${(opts.taxRate*100).toFixed(2)}%)</td>` +
+    `<td style="padding:6px 16px;text-align:right;font-size:12px;color:#6B7280">$${opts.taxAmount.toFixed(2)}</td></tr>` : '';
+
+  const scopeHtml = (opts.scopeItems && opts.scopeItems.length) ? `<div style="padding:20px 40px">` +
+    `<div style="font-family:'Segoe UI',sans-serif;font-size:14px;font-weight:600;color:${co.primaryColor};text-transform:uppercase;letter-spacing:1px;padding-bottom:6px;border-bottom:2px solid ${co.primaryColor};margin-bottom:12px">Scope of Work</div>` +
+    `<ul style="list-style:none;padding:0">${opts.scopeItems.map(s => `<li style="padding:3px 0;font-size:13px;color:#374151"><span style="color:${co.accentColor};font-weight:700;margin-right:8px">›</span>${esc(s)}</li>`).join('')}</ul></div>` : '';
+
+  const notesHtml = opts.notes ? `<div style="padding:0 40px 20px"><div style="background:#FFFDE7;padding:14px 18px;border-radius:8px;border-left:3px solid ${co.accentColor}">` +
+    `<div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#92400E;margin-bottom:4px;font-weight:600">Notes</div>` +
+    `<p style="font-size:13px;color:#374151;line-height:1.6">${esc(opts.notes)}</p></div></div>` : '';
+
+  const paid = opts.amountPaid || 0;
+  const balanceHtml = (!isEst && paid > 0) ? `<div style="padding:0 40px 16px;display:flex;justify-content:flex-end"><div style="min-width:260px">` +
+    `<div style="display:flex;justify-content:space-between;padding:4px 0;font-size:14px;color:#22C55E"><span>Amount Paid</span><span>-$${paid.toFixed(2)}</span></div>` +
+    `<div style="display:flex;justify-content:space-between;padding:4px 0;font-size:16px;font-weight:700;color:#F59E0B"><span>Balance Due</span><span>$${(opts.total - paid).toFixed(2)}</span></div>` +
+    `</div></div>` : '';
+
+  const thirdLabel = isEst ? 'Service Date' : isWO ? 'Scheduled Date' : 'Due Date';
+  const thirdValue = isEst ? (opts.serviceDate || 'TBD') : isWO ? (opts.serviceDate || 'TBD') : (opts.dueDate || '--');
+
+  const totalLabel = isEst ? 'ESTIMATED TOTAL:' : isReceipt ? 'AMOUNT PAID:' : isWO ? 'ESTIMATED COST:' : 'TOTAL DUE:';
+
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${esc(typeLabel)} ${esc(opts.docNumber)} | ${esc(co.name)}</title>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Open+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Open Sans",sans-serif;color:#1f2937;background:#fff;max-width:850px;margin:0 auto}
+@media print{
+  body{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;max-width:100%}
+  .no-print{display:none!important}
+  @page{margin:0.4in}
+}
+.delivery-bar{background:#f1f5f9;padding:12px 40px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;border-bottom:1px solid #e2e8f0}
+.delivery-bar button{padding:8px 18px;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:all .15s}
+.btn-print{background:${co.primaryColor};color:#fff}.btn-print:hover{opacity:.9}
+.btn-pdf{background:#059669;color:#fff}.btn-pdf:hover{background:#047857}
+.btn-email{background:#2563EB;color:#fff}.btn-email:hover{background:#1D4ED8}
+.btn-sms{background:#7C3AED;color:#fff}.btn-sms:hover{background:#6D28D9}
+.email-modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:1000;justify-content:center;align-items:center}
+.email-modal.active{display:flex}
+.email-form{background:#fff;border-radius:12px;padding:28px;width:420px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.email-form h3{margin:0 0 16px;font-size:18px;color:${co.primaryColor}}
+.email-form input,.email-form textarea{width:100%;padding:10px 14px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;margin-bottom:12px;font-family:inherit}
+.email-form textarea{height:80px;resize:vertical}
+.email-form .btn-row{display:flex;gap:8px;justify-content:flex-end}
+.sms-modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:1000;justify-content:center;align-items:center}
+.sms-modal.active{display:flex}
+.sms-form{background:#fff;border-radius:12px;padding:28px;width:420px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.sms-form h3{margin:0 0 16px;font-size:18px;color:#7C3AED}
+.sms-form input{width:100%;padding:10px 14px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;margin-bottom:12px}
+.sms-form .btn-row{display:flex;gap:8px;justify-content:flex-end}
+.status-toast{position:fixed;bottom:24px;right:24px;padding:14px 24px;border-radius:10px;color:#fff;font-weight:600;font-size:14px;z-index:2000;opacity:0;transition:opacity .3s;pointer-events:none}
+.status-toast.show{opacity:1}
+.status-toast.success{background:#059669}
+.status-toast.error{background:#DC2626}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.2/html2pdf.bundle.min.js"></script>
+</head><body>
+
+<!-- DELIVERY ACTION BAR (hidden in print) -->
+<div class="delivery-bar no-print" id="deliveryBar">
+  <button class="btn-print" onclick="window.print()">🖨️ Print</button>
+  <button class="btn-pdf" onclick="downloadPDF()">📄 Save PDF</button>
+  <button class="btn-email" onclick="showEmailModal()">📧 Email</button>
+  <button class="btn-sms" onclick="showSMSModal()">💬 SMS</button>
+  <span style="margin-left:auto;font-size:12px;color:#6B7280" id="docMeta">${esc(typeLabel)} ${esc(opts.docNumber)}</span>
+</div>
+
+<!-- EMAIL MODAL -->
+<div class="email-modal" id="emailModal">
+  <div class="email-form">
+    <h3>📧 Email ${esc(typeLabel)}</h3>
+    <input type="email" id="emailTo" placeholder="Recipient email" value="${esc(opts.customerEmail || '')}">
+    <input type="text" id="emailSubject" value="${esc(typeLabel)} ${esc(opts.docNumber)} from ${esc(co.name)}">
+    <textarea id="emailMessage" placeholder="Optional message...">${esc(typeLabel)} ${esc(opts.docNumber)} is attached. Total: $${opts.total.toFixed(2)}${opts.dueDate ? '. Due: ' + opts.dueDate : ''}.\\n\\nThank you for your business!\\n${esc(co.name)}</textarea>
+    <div class="btn-row">
+      <button onclick="hideEmailModal()" style="padding:8px 18px;border:1px solid #d1d5db;border-radius:6px;background:#fff;cursor:pointer">Cancel</button>
+      <button onclick="sendEmail()" class="btn-email" style="border:none;border-radius:6px;padding:8px 24px;cursor:pointer">Send Email</button>
+    </div>
+  </div>
+</div>
+
+<!-- SMS MODAL -->
+<div class="sms-modal" id="smsModal">
+  <div class="sms-form">
+    <h3>💬 Send via SMS</h3>
+    <input type="tel" id="smsTo" placeholder="Phone number (e.g. +14325551234)" value="${esc(opts.customerPhone || '')}">
+    <input type="text" id="smsMessage" value="${esc(typeLabel)} ${esc(opts.docNumber)} from ${esc(co.name)}: $${opts.total.toFixed(2)}${opts.dueDate ? ' due ' + opts.dueDate : ''}. View: ">
+    <div class="btn-row">
+      <button onclick="hideSMSModal()" style="padding:8px 18px;border:1px solid #d1d5db;border-radius:6px;background:#fff;cursor:pointer">Cancel</button>
+      <button onclick="sendSMS()" class="btn-sms" style="border:none;border-radius:6px;padding:8px 24px;color:#fff;cursor:pointer">Send SMS</button>
+    </div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div class="status-toast" id="toast"></div>
+
+<!-- DOCUMENT CONTENT -->
+<div id="documentContent">
+<div style="background:${co.primaryColor};color:#fff;padding:24px 40px;display:flex;justify-content:space-between;align-items:center">
+  <div style="display:flex;align-items:center;gap:16px">
+    <div>
+      <div style="font-family:Oswald,sans-serif;font-size:28px;font-weight:700;line-height:1">${esc(co.name)}</div>
+      <div style="font-size:9px;letter-spacing:2.5px;text-transform:uppercase;color:rgba(255,255,255,.7);margin-top:3px">${esc(co.tagline)} | ${esc(co.city)}</div>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:24px">
+    <div style="text-align:right;font-size:11px;color:rgba(255,255,255,.8);line-height:1.8">
+      <div>${esc(co.phone)}</div>
+      <div>${esc(co.email)}</div>
+      <div>${esc(co.website)}</div>
+    </div>
+    <div style="background:${badgeBg};color:#fff;padding:8px 22px;border-radius:6px;font-family:Oswald,sans-serif;font-size:18px;font-weight:600;letter-spacing:2px">${esc(typeLabel)}</div>
+  </div>
+</div>
+
+<div style="display:flex;border-bottom:2px solid #E5E7EB">
+  <div style="flex:1;padding:16px 20px;text-align:center;border-right:1px solid #E5E7EB">
+    <div style="font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:#9CA3AF;margin-bottom:4px">${esc(typeLabel)} Number</div>
+    <div style="font-size:16px;font-weight:600;color:${co.primaryColor}">${esc(opts.docNumber)}</div>
+  </div>
+  <div style="flex:1;padding:16px 20px;text-align:center;border-right:1px solid #E5E7EB">
+    <div style="font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:#9CA3AF;margin-bottom:4px">Date</div>
+    <div style="font-size:16px;font-weight:600;color:${co.primaryColor}">${esc(opts.date)}</div>
+  </div>
+  <div style="flex:1;padding:16px 20px;text-align:center">
+    <div style="font-size:9px;text-transform:uppercase;letter-spacing:1.5px;color:#9CA3AF;margin-bottom:4px">${esc(thirdLabel)}</div>
+    <div style="font-size:16px;font-weight:600;color:${co.primaryColor}">${esc(thirdValue)}</div>
+  </div>
+</div>
+
+<div style="padding:20px 40px">
+  <div style="font-family:Oswald,sans-serif;font-size:14px;font-weight:600;color:${co.primaryColor};text-transform:uppercase;letter-spacing:1px;padding-bottom:6px;border-bottom:2px solid ${co.primaryColor};margin-bottom:16px">${isEst || isWO ? 'Service Details' : 'Bill To'}</div>
+  <div style="display:flex;gap:20px;margin-bottom:16px">
+    <div style="flex:1;background:#F9FAFB;border-radius:8px;padding:14px 18px">
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:${co.accentColor};margin-bottom:6px">Customer</div>
+      <p style="font-size:14px;font-weight:600;color:#374151;margin:0">${esc(opts.customerName)}</p>
+      ${opts.customerAddress ? `<p style="font-size:13px;color:#6B7280;margin:4px 0 0">${esc(opts.customerAddress)}</p>` : ''}
+      ${opts.customerPhone ? `<p style="font-size:13px;color:#6B7280;margin:2px 0 0">${esc(opts.customerPhone)}</p>` : ''}
+      ${opts.customerEmail ? `<p style="font-size:13px;color:#6B7280;margin:2px 0 0">${esc(opts.customerEmail)}</p>` : ''}
+    </div>
+    ${(isEst || isWO) && opts.jobTitle ? `<div style="flex:1;background:#F9FAFB;border-radius:8px;padding:14px 18px">
+      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:${co.accentColor};margin-bottom:6px">Project</div>
+      <p style="font-size:14px;font-weight:600;color:#374151;margin:0">${esc(opts.jobTitle)}</p>
+      ${opts.serviceType ? `<p style="font-size:13px;color:#6B7280;margin:4px 0 0">${esc(opts.serviceType)}</p>` : ''}
+    </div>` : ''}
+  </div>
+</div>
+
+<div style="padding:0 40px 16px">
+  <div style="font-family:Oswald,sans-serif;font-size:14px;font-weight:600;color:${co.primaryColor};text-transform:uppercase;letter-spacing:1px;padding-bottom:6px;border-bottom:2px solid ${co.primaryColor};margin-bottom:12px">Cost Breakdown</div>
+  <table style="width:100%;border-collapse:collapse">
+    <thead><tr>
+      <th style="background:${co.primaryColor};color:#fff;font-family:Oswald,sans-serif;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;padding:10px 16px;text-align:left">Description</th>
+      <th style="background:${co.primaryColor};color:#fff;font-family:Oswald,sans-serif;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;padding:10px 16px;text-align:center">Qty</th>
+      <th style="background:${co.primaryColor};color:#fff;font-family:Oswald,sans-serif;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;padding:10px 16px;text-align:right">Rate</th>
+      <th style="background:${co.primaryColor};color:#fff;font-family:Oswald,sans-serif;font-size:11px;text-transform:uppercase;letter-spacing:1.5px;padding:10px 16px;text-align:right">Amount</th>
+    </tr></thead>
+    <tbody>${lineRows}${subtotalRow}${taxRow}</tbody>
+  </table>
+  <div style="background:${co.primaryColor};display:flex;justify-content:space-between;align-items:center;padding:12px 20px;border-radius:6px;margin-top:8px">
+    <span style="color:#fff;font-family:Oswald,sans-serif;font-size:16px;letter-spacing:1px">${esc(totalLabel)}</span>
+    <span style="color:${co.accentColor};font-family:Oswald,sans-serif;font-size:22px;font-weight:700">$${opts.total.toFixed(2)}</span>
+  </div>
+</div>
+
+${balanceHtml}
+${scopeHtml}
+${notesHtml}
+
+${opts.paymentTerms ? `<div style="padding:0 40px 20px"><div style="background:#f8f9fa;padding:16px 18px;border-radius:8px;font-size:12px;color:#666">
+  <div style="font-weight:700;color:${co.primaryColor};margin-bottom:6px;text-transform:uppercase;letter-spacing:1px;font-size:11px">Payment Terms</div>
+  <p style="margin:0">${esc(opts.paymentTerms)}</p>
+</div></div>` : ''}
+
+<div style="background:${co.primaryColor};padding:20px 40px;text-align:center;border-top:3px solid ${co.accentColor};margin-top:32px">
+  <div style="color:rgba(255,255,255,.8);font-size:11px;letter-spacing:1px">${esc(co.name)} &nbsp;|&nbsp; ${esc(co.city)} &nbsp;|&nbsp; ${esc(co.phone)} &nbsp;|&nbsp; ${esc(co.email)}</div>
+  <div style="color:${co.accentColor};font-family:Oswald,sans-serif;font-size:12px;letter-spacing:2px;margin-top:8px">${esc(co.tagline)}</div>
+</div>
+</div>
+
+<script>
+const DOC_ID = '${esc(opts.docNumber)}';
+const DOC_TYPE = '${esc(typeLabel)}';
+const CUSTOMER = '${esc(opts.customerName)}';
+const API_BASE = window.DOC_API_BASE || '';
+
+function toast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'status-toast show ' + (type || 'success');
+  setTimeout(() => t.className = 'status-toast', 3000);
+}
+
+function downloadPDF() {
+  const el = document.getElementById('documentContent');
+  const filename = DOC_TYPE.replace(/\\s+/g, '_') + '_' + DOC_ID + '_' + CUSTOMER.replace(/[^a-zA-Z0-9]/g, '_') + '.pdf';
+  html2pdf().set({
+    margin: 0.3,
+    filename: filename,
+    image: { type: 'jpeg', quality: 0.98 },
+    html2canvas: { scale: 2, useCORS: true, logging: false },
+    jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' },
+    pagebreak: { mode: ['avoid-all', 'css', 'legacy'] }
+  }).from(el).save().then(() => toast('PDF saved: ' + filename)).catch(e => toast('PDF error: ' + e.message, 'error'));
+}
+
+function showEmailModal() { document.getElementById('emailModal').classList.add('active'); }
+function hideEmailModal() { document.getElementById('emailModal').classList.remove('active'); }
+function showSMSModal() { document.getElementById('smsModal').classList.add('active'); }
+function hideSMSModal() { document.getElementById('smsModal').classList.remove('active'); }
+
+async function sendEmail() {
+  const to = document.getElementById('emailTo').value.trim();
+  const subject = document.getElementById('emailSubject').value.trim();
+  const message = document.getElementById('emailMessage').value.trim();
+  if (!to) { toast('Enter recipient email', 'error'); return; }
+  hideEmailModal();
+  toast('Sending email...');
+  try {
+    const viewUrl = window.location.href;
+    const resp = await fetch(API_BASE + '/documents/deliver/email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify({ to, subject, message, doc_id: DOC_ID, view_url: viewUrl })
+    });
+    const data = await resp.json();
+    if (data.ok) toast('Email sent to ' + to);
+    else toast('Email failed: ' + (data.error || 'unknown'), 'error');
+  } catch (e) { toast('Email error: ' + e.message, 'error'); }
+}
+
+async function sendSMS() {
+  const to = document.getElementById('smsTo').value.trim();
+  const message = document.getElementById('smsMessage').value.trim();
+  if (!to) { toast('Enter phone number', 'error'); return; }
+  hideSMSModal();
+  toast('Sending SMS...');
+  try {
+    const viewUrl = window.location.href;
+    const fullMsg = message + ' ' + viewUrl;
+    const resp = await fetch(API_BASE + '/documents/deliver/sms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify({ to, body: fullMsg, doc_id: DOC_ID })
+    });
+    const data = await resp.json();
+    if (data.ok) toast('SMS sent to ' + to);
+    else toast('SMS failed: ' + (data.error || 'unknown'), 'error');
+  } catch (e) { toast('SMS error: ' + e.message, 'error'); }
+}
+
+function getAuthHeaders() {
+  try {
+    const token = localStorage.getItem('fb_token');
+    if (token) return { 'Authorization': 'Bearer ' + token };
+  } catch {}
+  return {};
+}
+</script>
+</body></html>`;
+}
+
+// Company config helper — reads from settings table or env vars
+async function getCompanyConfig(db: D1Database, env: Env): Promise<{
+  name: string; phone: string; email: string; tagline: string;
+  website: string; city: string; primaryColor: string; accentColor: string;
+}> {
+  const rows = await db.prepare('SELECT key, value FROM settings').all();
+  const s: Record<string, string> = {};
+  for (const r of rows.results as any[]) s[r.key] = r.value;
+  return {
+    name: s.company_name || env.COMPANY_NAME || 'Pro Finish USA',
+    phone: s.company_phone || env.COMPANY_PHONE || '(432) 466-5310',
+    email: s.company_email || env.COMPANY_EMAIL || 'profinishcartx@gmail.com',
+    tagline: s.company_tagline || env.COMPANY_TAGLINE || 'Quality Craftsmanship. Every Detail. Every Time.',
+    website: s.company_website || env.SITE_URL || 'profinishusa.com',
+    city: s.company_city || 'Big Spring, TX',
+    primaryColor: s.company_primary_color || '#0D2847',
+    accentColor: s.company_accent_color || '#FFD700',
+  };
+}
+
+// ─── Generate Document (store HTML to R2, return view URL) ────
+app.post('/documents/generate', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+
+  // Required: type (INVOICE|ESTIMATE|WORK_ORDER|RECEIPT|STATEMENT) + source_id (invoice_id or job_id)
+  const docType = (b.type || 'INVOICE').toUpperCase() as 'ESTIMATE' | 'INVOICE' | 'WORK_ORDER' | 'RECEIPT' | 'STATEMENT';
+  const sourceId = b.source_id || b.invoice_id || b.job_id;
+  if (!sourceId) return c.json({ error: 'source_id required (invoice_id or job_id)' }, 400);
+
+  const company = await getCompanyConfig(c.env.DB, c.env);
+  let docData: any;
+
+  if (docType === 'INVOICE' || docType === 'RECEIPT' || docType === 'STATEMENT') {
+    // Load invoice with customer + items + payments
+    const inv = await c.env.DB.prepare(
+      'SELECT i.*, c.name as customer_name, c.email as customer_email, c.phone as customer_phone, c.address as customer_address, c.city as customer_city FROM invoices i LEFT JOIN customers c ON i.customer_id = c.id WHERE i.id = ?'
+    ).bind(sourceId).first() as any;
+    if (!inv) return c.json({ error: 'Invoice not found' }, 404);
+    const items = await c.env.DB.prepare('SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY rowid').bind(sourceId).all();
+
+    docData = {
+      type: docType,
+      docNumber: inv.invoice_number || sourceId.slice(0, 8).toUpperCase(),
+      date: inv.issue_date || new Date().toISOString().split('T')[0],
+      dueDate: inv.due_date,
+      customerName: inv.customer_name || 'Customer',
+      customerEmail: inv.customer_email || '',
+      customerPhone: inv.customer_phone || '',
+      customerAddress: [inv.customer_address, inv.customer_city].filter(Boolean).join(', '),
+      items: (items.results as any[]).map((it: any) => ({
+        description: it.description, qty: it.quantity || 1, rate: it.unit_price || 0, amount: it.total || 0,
+      })),
+      subtotal: inv.subtotal || 0,
+      taxRate: inv.tax_rate || 0,
+      taxAmount: inv.tax_amount || 0,
+      total: inv.total || 0,
+      amountPaid: docType === 'RECEIPT' ? inv.total : (inv.amount_paid || 0),
+      notes: inv.notes || '',
+      paymentTerms: inv.payment_terms === 'net_30' ? 'Net 30 — Payment due within 30 days of invoice date.' :
+                     inv.payment_terms === 'net_15' ? 'Net 15 — Payment due within 15 days.' :
+                     inv.payment_terms === 'due_on_receipt' ? 'Due on receipt.' : '',
+      company,
+    };
+  } else {
+    // ESTIMATE or WORK_ORDER — load from jobs
+    const job = await c.env.DB.prepare(
+      'SELECT j.*, c.name as customer_name, c.email as customer_email, c.phone as customer_phone, c.address as customer_address, c.city as customer_city FROM jobs j LEFT JOIN customers c ON j.customer_id = c.id WHERE j.id = ?'
+    ).bind(sourceId).first() as any;
+    if (!job) return c.json({ error: 'Job not found' }, 404);
+
+    const estTotal = parseFloat(job.estimated_cost_high || job.estimated_cost_low || job.actual_cost) || 0;
+    const scopeItems: string[] = [];
+    if (job.notes || job.description) {
+      (job.notes || job.description || '').split(/[\n;]+/).forEach((l: string) => { const t = l.trim(); if (t) scopeItems.push(t); });
+    }
+
+    const now = new Date();
+    const docNum = `PF-${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
+
+    docData = {
+      type: docType,
+      docNumber: docNum,
+      date: now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
+      serviceDate: job.scheduled_date || 'TBD',
+      customerName: job.customer_name || 'Customer',
+      customerEmail: job.customer_email || '',
+      customerPhone: job.customer_phone || '',
+      customerAddress: [job.customer_address || job.address, job.customer_city || job.city].filter(Boolean).join(', '),
+      jobTitle: job.title || '',
+      serviceType: job.service_type || '',
+      items: [{ description: (job.service_type || 'Service') + ' — ' + (job.title || 'Project'), qty: 1, rate: estTotal, amount: estTotal }],
+      subtotal: estTotal,
+      taxRate: 0,
+      taxAmount: 0,
+      total: estTotal,
+      scopeItems,
+      notes: '',
+      company,
+    };
+  }
+
+  // Generate HTML
+  const html = buildDocumentHTML(docData);
+
+  // Store to R2 with organized path
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const safeCustomer = (docData.customerName || 'customer').replace(/[^a-zA-Z0-9]/g, '_').slice(0, 30);
+  const r2Key = `profinish/documents/${year}/${month}/${docType.toLowerCase()}/${docData.docNumber}_${safeCustomer}.html`;
+  await c.env.R2.put(r2Key, html, { httpMetadata: { contentType: 'text/html' } });
+
+  // Create delivery tracking record
+  const deliveryId = uid();
+  const viewToken = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO document_deliveries (id, doc_type, doc_number, source_id, customer_name, customer_email, customer_phone, r2_key, view_token, total, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+  ).bind(deliveryId, docType, docData.docNumber, sourceId, docData.customerName, docData.customerEmail || '', docData.customerPhone || '', r2Key, viewToken, docData.total).run();
+
+  const viewUrl = `${c.env.SITE_URL || 'https://profinish-api.bmcii1976.workers.dev'}/documents/view/${viewToken}`;
+
+  return c.json({
+    ok: true,
+    delivery_id: deliveryId,
+    doc_number: docData.docNumber,
+    r2_key: r2Key,
+    view_url: viewUrl,
+    view_token: viewToken,
+  });
+});
+
+// ─── Public Document View (no auth — token-based) ────────
+app.get('/documents/view/:token', async (c) => {
+  const token = c.req.param('token');
+  const doc = await c.env.DB.prepare('SELECT * FROM document_deliveries WHERE view_token = ?').bind(token).first() as any;
+  if (!doc) return c.html('<h1>Document not found</h1>', 404);
+
+  // Track view
+  await c.env.DB.prepare("UPDATE document_deliveries SET last_viewed_at = datetime('now'), view_count = COALESCE(view_count, 0) + 1 WHERE id = ?").bind(doc.id).run();
+
+  // Load from R2
+  const obj = await c.env.R2.get(doc.r2_key);
+  if (!obj) return c.html('<h1>Document expired or removed</h1>', 404);
+  const html = await obj.text();
+
+  // Inject the API base URL into the document for delivery buttons
+  const apiBase = c.env.SITE_URL || 'https://profinish-api.bmcii1976.workers.dev';
+  const injectedHtml = html.replace("window.DOC_API_BASE || ''", `'${apiBase}'`);
+
+  return c.html(injectedHtml);
+});
+
+// ─── List Documents (admin) ──────────────────────────────
+app.get('/documents', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const type = c.req.query('type');
+  const limit = parseInt(c.req.query('limit') || '50');
+  let sql = 'SELECT * FROM document_deliveries WHERE 1=1';
+  const params: any[] = [];
+  if (type) { sql += ' AND doc_type = ?'; params.push(type.toUpperCase()); }
+  sql += ' ORDER BY created_at DESC LIMIT ?';
+  params.push(limit);
+  const rows = await c.env.DB.prepare(sql).bind(...params).all();
+  return c.json(rows.results);
+});
+
+// ─── Get Document Detail ─────────────────────────────────
+app.get('/documents/:id', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const doc = await c.env.DB.prepare('SELECT * FROM document_deliveries WHERE id = ?').bind(c.req.param('id')).first();
+  if (!doc) return c.json({ error: 'Not found' }, 404);
+  return c.json(doc);
+});
+
+// ─── Email Delivery ──────────────────────────────────────
+app.post('/documents/deliver/email', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+  const { to, subject, message, doc_id, view_url } = b;
+  if (!to) return c.json({ error: 'to (email) required' }, 400);
+
+  const company = await getCompanyConfig(c.env.DB, c.env);
+
+  // Build email HTML
+  const emailHtml = `<!DOCTYPE html><html><body style="font-family:'Open Sans',Arial,sans-serif;max-width:600px;margin:0 auto;background:#f8f9fa;padding:20px">
+<div style="background:${company.primaryColor};color:#fff;padding:20px 30px;border-radius:10px 10px 0 0">
+  <h1 style="margin:0;font-size:22px;font-family:Oswald,sans-serif">${sanitize(company.name)}</h1>
+  <p style="margin:4px 0 0;font-size:12px;color:rgba(255,255,255,.7)">${sanitize(company.tagline)}</p>
+</div>
+<div style="background:#fff;padding:30px;border:1px solid #e5e7eb;border-top:none">
+  <p style="font-size:14px;color:#374151;line-height:1.8;white-space:pre-wrap">${sanitize(message || '')}</p>
+  ${view_url ? `<div style="text-align:center;margin:24px 0">
+    <a href="${sanitize(view_url)}" style="background:${company.primaryColor};color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;display:inline-block">View Document</a>
+  </div>
+  <p style="font-size:12px;color:#9CA3AF;text-align:center">Or copy this link: ${sanitize(view_url)}</p>` : ''}
+</div>
+<div style="padding:16px 30px;text-align:center;font-size:11px;color:#9CA3AF">
+  ${sanitize(company.name)} | ${sanitize(company.city)} | ${sanitize(company.phone)} | ${sanitize(company.email)}
+</div>
+</body></html>`;
+
+  // Send via Resend API
+  const resendKey = c.env.RESEND_API_KEY;
+  if (!resendKey) {
+    // Log the delivery attempt even without email provider
+    await c.env.DB.prepare(
+      "INSERT INTO document_deliveries (id, doc_type, doc_number, source_id, customer_name, customer_email, delivery_channel, delivery_status, r2_key, view_token, created_at) VALUES (?, 'EMAIL', ?, ?, ?, ?, 'email', 'failed_no_provider', '', '', datetime('now'))"
+    ).bind(uid(), doc_id || '', '', '', to).run();
+    return c.json({ ok: false, error: 'Email provider not configured. Set RESEND_API_KEY via: npx wrangler secret put RESEND_API_KEY --name profinish-api' }, 503);
+  }
+
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: `${company.name} <${company.email.includes('@') ? company.email : 'noreply@profinishusa.com'}>`,
+        to: [to],
+        subject: subject || `Document from ${company.name}`,
+        html: emailHtml,
+      }),
+    });
+    const data = await resp.json() as any;
+
+    // Log delivery
+    if (doc_id) {
+      await c.env.DB.prepare(
+        "UPDATE document_deliveries SET delivery_channel = 'email', delivery_status = ?, delivered_to = ?, delivered_at = datetime('now') WHERE doc_number = ? OR id = ?"
+      ).bind(resp.ok ? 'sent' : 'failed', to, doc_id, doc_id).run();
+    }
+
+    if (resp.ok) return c.json({ ok: true, email_id: data.id });
+    return c.json({ ok: false, error: data.message || 'Email send failed' }, 502);
+  } catch (e: any) {
+    return c.json({ ok: false, error: e.message }, 500);
+  }
+});
+
+// ─── SMS Delivery ────────────────────────────────────────
+app.post('/documents/deliver/sms', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+  const { to, body: msgBody, doc_id } = b;
+  if (!to || !msgBody) return c.json({ error: 'to and body required' }, 400);
+
+  const { SID, TOKEN, FROM } = {
+    SID: c.env.TWILIO_ACCOUNT_SID,
+    TOKEN: c.env.TWILIO_AUTH_TOKEN,
+    FROM: c.env.TWILIO_PHONE_NUMBER,
+  };
+  if (!SID || !TOKEN || !FROM) return c.json({ ok: false, error: 'Twilio not configured' }, 503);
+
+  try {
+    const params = new URLSearchParams({ To: to, From: FROM, Body: msgBody });
+    const resp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${SID}/Messages.json`, {
+      method: 'POST', body: params,
+      headers: { 'Authorization': 'Basic ' + btoa(SID + ':' + TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+
+    // Log delivery
+    if (doc_id) {
+      await c.env.DB.prepare(
+        "UPDATE document_deliveries SET delivery_channel = 'sms', delivery_status = ?, delivered_to = ?, delivered_at = datetime('now') WHERE doc_number = ? OR id = ?"
+      ).bind(resp.ok ? 'sent' : 'failed', to, doc_id, doc_id).run();
+    }
+
+    return c.json({ ok: resp.ok, status: resp.status });
+  } catch (e: any) {
+    return c.json({ ok: false, error: e.message }, 500);
+  }
+});
+
+// ─── Delivery Settings (configurable per-tenant) ────────
+app.get('/documents/settings', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const rows = await c.env.DB.prepare("SELECT key, value FROM settings WHERE key LIKE 'doc_%' OR key LIKE 'company_%'").all();
+  const settings: Record<string, string> = {};
+  for (const r of rows.results as any[]) settings[r.key] = r.value;
+  return c.json(settings);
+});
+
+app.put('/documents/settings', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+  // Batch update settings
+  for (const [key, value] of Object.entries(b)) {
+    if (typeof key === 'string' && (key.startsWith('doc_') || key.startsWith('company_'))) {
+      await c.env.DB.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, datetime("now"))').bind(key, String(value)).run();
+    }
+  }
+  return c.json({ ok: true });
 });
 
 export default app;
