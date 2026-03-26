@@ -1627,7 +1627,9 @@ app.post('/documents/generate', async (c) => {
     `INSERT INTO document_deliveries (id, doc_type, doc_number, source_id, customer_name, customer_email, customer_phone, r2_key, view_token, total, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
   ).bind(deliveryId, docType, docData.docNumber, sourceId, docData.customerName, docData.customerEmail || '', docData.customerPhone || '', r2Key, viewToken, docData.total).run();
 
-  const viewUrl = `${c.env.SITE_URL || 'https://profinish-api.bmcii1976.workers.dev'}/documents/view/${viewToken}`;
+  // Always use Worker URL for document views (static site can't serve dynamic routes)
+  const workerUrl = new URL(c.req.url).origin;
+  const viewUrl = `${workerUrl}/documents/view/${viewToken}`;
 
   return c.json({
     ok: true,
@@ -1654,7 +1656,7 @@ app.get('/documents/view/:token', async (c) => {
   const html = await obj.text();
 
   // Inject the API base URL into the document for delivery buttons
-  const apiBase = c.env.SITE_URL || 'https://profinish-api.bmcii1976.workers.dev';
+  const apiBase = new URL(c.req.url).origin;
   const injectedHtml = html.replace("window.DOC_API_BASE || ''", `'${apiBase}'`);
 
   return c.html(injectedHtml);
