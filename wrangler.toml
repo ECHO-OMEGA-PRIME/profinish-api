@@ -18,7 +18,11 @@ database_id = "83b4b2ef-cd54-4b49-a54e-f5af5bdd97fe"
 binding = "R2"
 bucket_name = "echo-prime-media"
 
+[[services]]
+binding = "DOC_DELIVERY"
+service = "echo-document-delivery"
+
 # [vars] secrets set via wrangler secret put:
 # TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
 # ECHO_API_KEY (for shared brain / memory prime)
-# ZOHO_SMTP_USER, ZOHO_SMTP_PASS
+# DOC_TENANT_KEY (tenant key for echo-document-delivery)
