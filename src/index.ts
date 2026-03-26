@@ -787,35 +787,29 @@ app.post('/receipt/scan', async (c) => {
   const key = `profinish/receipts/${Date.now()}.jpg`;
   const bytes = Uint8Array.from(atob(b.image_base64), ch => ch.charCodeAt(0));
   await c.env.R2.put(key, bytes, { httpMetadata: { contentType: 'image/jpeg' } });
-  // Use LLM to extract receipt data (Azure GPT-4o primary, OpenAI fallback)
+  // Use Claude vision to extract receipt data (FREE via OAuth proxy)
   try {
-    const azureKey = c.env.AZURE_OPENAI_KEY;
-    const openaiKey = c.env.OPENAI_API_KEY;
-    if (!azureKey && !openaiKey) return c.json({ receipt_url: key, vendor: '', total: 0, date: '', items: [], error: 'Vision not configured' });
-    const visionBody = JSON.stringify({
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'text', text: 'Extract from this receipt: vendor name, total amount, date, and list of items with prices. Return JSON: {"vendor":"","total":0,"date":"","items":[{"name":"","price":0}]}' },
-          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${b.image_base64}` } }
-        ]
-      }],
-      max_tokens: 512
+    const claudeResp = await fetch(CLAUDE_PROXY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Echo-API-Key': CLAUDE_PROXY_KEY },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        system: 'You are a receipt OCR assistant. Extract data and return ONLY valid JSON.',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Extract from this receipt: vendor name, total amount, date, and list of items with prices. Return ONLY JSON: {"vendor":"","total":0,"date":"","items":[{"name":"","price":0}]}' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b.image_base64 } }
+          ]
+        }],
+        max_tokens: 512,
+      }),
     });
-    let llmResp;
-    if (azureKey) {
-      llmResp = await fetch('https://echoomegaopenai.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview', {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'api-key': azureKey }, body: visionBody
-      });
+    if (!claudeResp.ok) {
+      return c.json({ receipt_url: key, vendor: '', total: 0, date: '', items: [], error: `Vision error ${claudeResp.status}` });
     }
-    if (!llmResp?.ok && openaiKey) {
-      llmResp = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiKey}` },
-        body: JSON.stringify({ ...JSON.parse(visionBody), model: 'gpt-4o-mini' })
-      });
-    }
-    const llmData: any = await llmResp!.json();
-    const content = llmData.choices?.[0]?.message?.content || '{}';
+    const claudeData: any = await claudeResp.json();
+    const content = claudeData.content?.[0]?.text || '{}';
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
     return c.json({ ...parsed, receipt_url: key });
