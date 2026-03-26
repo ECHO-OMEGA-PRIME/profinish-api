@@ -1,0 +1,24 @@
+name = "profinish-api"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+OWNER_EMAIL = "adam@profinishusa.com"
+OWNER_PHONE = "4324665310"
+ADAM_PHONE = "+14324665310"
+SITE_URL = "https://profinishusa.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "profinish"
+database_id = "83b4b2ef-cd54-4b49-a54e-f5af5bdd97fe"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "echo-prime-media"
+
+# [vars] secrets set via wrangler secret put:
+# TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
+# ECHO_API_KEY (for shared brain / memory prime)
+# ZOHO_SMTP_USER, ZOHO_SMTP_PASS
