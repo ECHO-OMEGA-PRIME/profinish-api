@@ -1056,8 +1056,8 @@ app.delete('/subscriptions/:id', async (c) => {
   return c.json({ ok: true });
 });
 
-// ─── Belle AI Chat (Azure GPT-4.1 primary, OpenAI fallback) ─
-const BELLE_SYSTEM_PROMPT = `You are Belle, the friendly and knowledgeable AI assistant for Pro Finish Custom Carpentry in Big Spring, TX. Owner: Adam McLemore. You help customers:
+// ─── Adam AI Chat (Claude Hybrid Proxy primary — FREE) ─────
+const BELLE_SYSTEM_PROMPT = `You are Adam AI, the friendly and knowledgeable AI assistant for Pro Finish Custom Carpentry in Big Spring, TX. Owner: Adam McLemore. You help customers:
 1. Get free estimates and project advice for all services
 2. Schedule visits with Adam
 3. Answer questions about services: trim carpentry, cabinet installation, flooring (hardwood, laminate, LVP, tile), framing, decking, remodeling
@@ -1071,24 +1071,21 @@ Be warm, professional, and knowledgeable about carpentry and construction. Keep 
 
 IMPORTANT: You have INFINITE MEMORY. You remember every conversation with every customer. If given previous context, reference it naturally. Remember names, project details, preferences, and quotes discussed. Make returning customers feel recognized.`;
 
-app.post('/belle/chat', async (c) => {
-  const azureKey = c.env.AZURE_OPENAI_KEY;
-  const openaiKey = c.env.OPENAI_API_KEY;
-  if (!azureKey && !openaiKey) return c.json({ error: 'Chat not configured' }, 503);
+const CLAUDE_PROXY_URL = 'https://claude-proxy.echo-op.com/v1/messages';
+const CLAUDE_PROXY_KEY = 'echo-omega-prime-forge-x-2026';
 
+app.post('/belle/chat', async (c) => {
   const body = await c.req.json();
 
-  // Build messages array with Belle system prompt
-  let messages: Array<{role: string; content: string}> = [];
-
-  // System prompt + optional brain context
+  // Build system prompt + optional brain context
   let systemContent = BELLE_SYSTEM_PROMPT;
   if (body.context) systemContent += body.context;
-  messages.push({ role: 'system', content: systemContent });
+
+  // Build messages array (user/assistant only — Claude API takes system separately)
+  let messages: Array<{role: string; content: string}> = [];
 
   // Support both formats: {messages: [...]} and {message: "...", history: [...]}
   if (body.messages && body.messages.length) {
-    // Filter out any existing system messages (we provide our own)
     const nonSystem = body.messages.filter((m: any) => m.role !== 'system');
     messages.push(...nonSystem);
   } else if (body.message) {
@@ -1101,56 +1098,36 @@ app.post('/belle/chat', async (c) => {
   }
 
   const maxTokens = Math.min(body.max_tokens || 512, 1024);
-  const temperature = body.temperature ?? 0.8;
 
-  // Try Azure GPT-4.1 first (FREE)
-  if (azureKey) {
-    try {
-      const azureResp = await fetch(
-        'https://echoomegaopenai.openai.azure.com/openai/deployments/gpt41-eastus/chat/completions?api-version=2025-01-01-preview',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'api-key': azureKey },
-          body: JSON.stringify({ messages, max_tokens: maxTokens, temperature }),
-        }
-      );
-      if (azureResp.ok) {
-        const data: any = await azureResp.json();
-        const reply = data.choices?.[0]?.message?.content || '';
-        return c.json({ reply, provider: 'azure', model: 'gpt-4.1' });
-      }
-    } catch {}
-  }
-
-  // Fallback to OpenAI
-  if (openaiKey) {
-    try {
-      const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiKey}` },
-        body: JSON.stringify({ model: 'gpt-4o-mini', messages, max_tokens: maxTokens, temperature }),
-      });
-      if (!resp.ok) {
-        const errText = await resp.text();
-        return c.json({ error: 'LLM error', status: resp.status, detail: errText }, 502);
-      }
-      const data: any = await resp.json();
-      const reply = data.choices?.[0]?.message?.content || '';
-      return c.json({ reply, provider: 'openai', model: 'gpt-4o-mini' });
-    } catch (e: any) {
-      return c.json({ error: 'Chat failed', detail: e.message }, 500);
+  // Primary: Claude Hybrid Proxy (Haiku 4.5 — fast, FREE via OAuth)
+  try {
+    const claudeResp = await fetch(CLAUDE_PROXY_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Echo-API-Key': CLAUDE_PROXY_KEY,
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        system: systemContent,
+        messages,
+        max_tokens: maxTokens,
+      }),
+    });
+    if (claudeResp.ok) {
+      const data: any = await claudeResp.json();
+      const reply = data.content?.[0]?.text || '';
+      return c.json({ reply, provider: 'claude', model: 'claude-haiku-4-5' });
     }
+    const errText = await claudeResp.text();
+    return c.json({ error: 'LLM error', status: claudeResp.status, detail: errText }, 502);
+  } catch (e: any) {
+    return c.json({ error: 'Chat failed', detail: e.message }, 500);
   }
-
-  return c.json({ error: 'All LLM providers failed' }, 502);
 });
 
-// ─── Belle Vision (photo analysis — Azure GPT-4o primary) ─
+// ─── Adam AI Vision (photo analysis — Claude Hybrid Proxy) ─
 app.post('/belle/vision', async (c) => {
-  const azureKey = c.env.AZURE_OPENAI_KEY;
-  const openaiKey = c.env.OPENAI_API_KEY;
-  if (!azureKey && !openaiKey) return c.json({ error: 'Vision not configured' }, 503);
-
   const body = await c.req.json();
   const imageUrl = body.image_url;
   const imageBase64 = body.image_base64;
@@ -1158,35 +1135,52 @@ app.post('/belle/vision', async (c) => {
 
   if (!imageUrl && !imageBase64) return c.json({ error: 'image_url or image_base64 required' }, 400);
 
-  const imageContent = imageBase64
-    ? { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }
-    : { type: 'image_url', image_url: { url: imageUrl } };
+  // Claude vision uses content blocks with image source
+  const imageSource = imageBase64
+    ? { type: 'base64' as const, media_type: 'image/jpeg' as const, data: imageBase64 }
+    : { type: 'url' as const, url: imageUrl };
 
-  const visionBody = { messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, imageContent] }], max_tokens: 512 };
+  const userContent = [
+    { type: 'image', source: imageSource },
+    { type: 'text', text: prompt },
+  ];
 
   try {
-    let resp;
-    if (azureKey) {
-      resp = await fetch('https://echoomegaopenai.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview', {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'api-key': azureKey },
-        body: JSON.stringify(visionBody),
-      });
+    const resp = await fetch(CLAUDE_PROXY_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Echo-API-Key': CLAUDE_PROXY_KEY,
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        messages: [{ role: 'user', content: userContent }],
+        max_tokens: 512,
+      }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      return c.json({ error: 'Vision error', status: resp.status, detail: errText }, 502);
     }
-    if (!resp?.ok && openaiKey) {
-      resp = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiKey}` },
-        body: JSON.stringify({ ...visionBody, model: 'gpt-4o-mini' }),
-      });
-    }
-    if (!resp?.ok) {
-      const errText = await resp!.text();
-      return c.json({ error: 'Vision error', status: resp!.status, detail: errText }, 502);
-    }
-    const data = await resp!.json();
-    return c.json(data);
+    const data: any = await resp.json();
+    const reply = data.content?.[0]?.text || '';
+    return c.json({ reply, provider: 'claude', model: 'claude-haiku-4-5' });
   } catch (e: any) {
     return c.json({ error: 'Vision failed', detail: e.message }, 500);
   }
+});
+
+// ─── Adam AI aliases (renamed from Belle) ─────────────────
+app.post('/adam/chat', async (c) => {
+  // Forward to /belle/chat handler
+  const url = new URL(c.req.url);
+  url.pathname = '/belle/chat';
+  return app.fetch(new Request(url.toString(), { method: 'POST', headers: c.req.raw.headers, body: c.req.raw.body }), c.env, c.executionCtx);
+});
+app.post('/adam/vision', async (c) => {
+  const url = new URL(c.req.url);
+  url.pathname = '/belle/vision';
+  return app.fetch(new Request(url.toString(), { method: 'POST', headers: c.req.raw.headers, body: c.req.raw.body }), c.env, c.executionCtx);
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -1313,6 +1307,15 @@ app.post('/documents/deliver/sms', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const resp = await docFetch(c.env, '/deliver/sms', {
+    method: 'POST', body: JSON.stringify(await c.req.json()),
+  });
+  return c.json(await resp.json(), resp.status as any);
+});
+
+app.post('/documents/deliver/email-pdf', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const resp = await docFetch(c.env, '/deliver/email-pdf', {
     method: 'POST', body: JSON.stringify(await c.req.json()),
   });
   return c.json(await resp.json(), resp.status as any);
