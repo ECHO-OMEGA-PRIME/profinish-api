@@ -689,10 +689,15 @@ app.post('/expenses', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  // Validation
+  if (!b.category || typeof b.category !== 'string' || b.category.trim().length < 1) return c.json({ error: 'category is required' }, 400);
+  const amt = Number(b.amount);
+  if (isNaN(amt) || amt < 0 || amt > 999999) return c.json({ error: 'amount must be between 0 and 999999' }, 400);
+  if (b.expense_date && !/^\d{4}-\d{2}-\d{2}$/.test(b.expense_date)) return c.json({ error: 'expense_date must be YYYY-MM-DD' }, 400);
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO expenses (id, job_id, category, vendor, description, amount, receipt_url, receipt_data, expense_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, b.job_id || null, b.category, b.vendor || null, b.description || null, b.amount, b.receipt_url || null, b.receipt_data || null, b.expense_date || null).run();
+  ).bind(id, b.job_id || null, sanitize(maxLen(b.category, 100)), sanitize(maxLen(b.vendor || '', 200)), sanitize(maxLen(b.description || '', 500)), amt, maxLen(b.receipt_url || '', 500), b.receipt_data || null, b.expense_date || null).run();
   return c.json({ id });
 });
 
@@ -932,11 +937,14 @@ app.post('/time/start', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (!b.job_id || typeof b.job_id !== 'string') return c.json({ error: 'job_id is required' }, 400);
+  const rate = Number(b.hourly_rate || 75);
+  if (isNaN(rate) || rate < 0 || rate > 9999) return c.json({ error: 'hourly_rate must be between 0 and 9999' }, 400);
   const id = uid();
   const now = new Date().toISOString().slice(11, 16);
   await c.env.DB.prepare(
     'INSERT INTO time_entries (id, job_id, worker_name, date, start_time, hourly_rate) VALUES (?, ?, ?, date("now"), ?, ?)'
-  ).bind(id, b.job_id, b.worker_name || 'Adam', now, b.hourly_rate || 75).run();
+  ).bind(id, b.job_id, sanitize(maxLen(b.worker_name || 'Adam', 100)), now, rate).run();
   return c.json({ id, start_time: now });
 });
 
