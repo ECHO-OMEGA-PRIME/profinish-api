@@ -924,6 +924,39 @@ app.get('/blog/:idOrSlug', async (c) => {
   return row ? c.json(row) : c.json({ error: 'Not found' }, 404);
 });
 
+// Dynamic sitemap — includes all published blog posts and portfolio items
+app.get('/sitemap.xml', async (c) => {
+  const siteUrl = c.env.SITE_URL || 'https://profinishusa.com';
+  const today = new Date().toISOString().split('T')[0];
+  const posts = await c.env.DB.prepare("SELECT slug, published_at FROM blog_posts WHERE status = 'published' ORDER BY published_at DESC").all();
+  const portfolioItems = await c.env.DB.prepare("SELECT id, created_at FROM portfolio WHERE published = 1 ORDER BY display_order").all();
+
+  const staticPages = [
+    { path: '/', priority: '1.0', freq: 'monthly' },
+    { path: '/booking', priority: '0.9', freq: 'monthly' },
+    { path: '/portfolio', priority: '0.8', freq: 'weekly' },
+    { path: '/blog', priority: '0.7', freq: 'weekly' },
+    { path: '/office-ai', priority: '0.8', freq: 'monthly' },
+    { path: '/business-manager', priority: '0.8', freq: 'monthly' },
+    { path: '/privacy', priority: '0.3', freq: 'yearly' },
+    { path: '/terms', priority: '0.3', freq: 'yearly' },
+  ];
+
+  let urls = staticPages.map(p =>
+    `  <url><loc>${siteUrl}${p.path}</loc><lastmod>${today}</lastmod><changefreq>${p.freq}</changefreq><priority>${p.priority}</priority></url>`
+  ).join('\n');
+
+  // Blog posts
+  for (const p of (posts.results || [])) {
+    const post = p as any;
+    const date = (post.published_at || today).split(' ')[0];
+    urls += `\n  <url><loc>${siteUrl}/blog/${post.slug}</loc><lastmod>${date}</lastmod><changefreq>monthly</changefreq><priority>0.6</priority></url>`;
+  }
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls}\n</urlset>`;
+  return new Response(xml, { headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' } });
+});
+
 app.post('/blog', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
