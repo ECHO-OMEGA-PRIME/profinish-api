@@ -360,10 +360,14 @@ app.put('/customers/:id', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const body = await c.req.json();
+  if (body.email !== undefined && body.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) return c.json({ error: 'Invalid email format' }, 400);
+  if (body.phone !== undefined && body.phone && !/^[\d\s()+\-\.]{7,30}$/.test(body.phone)) return c.json({ error: 'Invalid phone format' }, 400);
+  if (body.preferred_language !== undefined && typeof body.preferred_language !== 'string') return c.json({ error: 'preferred_language must be a string' }, 400);
   const fields = ['name', 'email', 'phone', 'address', 'city', 'preferred_language', 'notes'].filter(f => body[f] !== undefined);
   if (!fields.length) return c.json({ error: 'No fields to update' }, 400);
+  const limits: Record<string, number> = { name: 200, email: 254, phone: 30, address: 500, city: 100, preferred_language: 10, notes: 1000 };
   const sets = fields.map(f => `${f} = ?`).join(', ');
-  const vals = fields.map(f => sanitize(body[f]));
+  const vals = fields.map(f => sanitize(maxLen(body[f], limits[f] || 500)));
   await c.env.DB.prepare(`UPDATE customers SET ${sets}, updated_at = datetime('now') WHERE id = ?`).bind(...vals, c.req.param('id')).run();
   return c.json({ ok: true });
 });
@@ -401,11 +405,16 @@ app.post('/jobs', async (c) => {
   if (!b.service_type || typeof b.service_type !== 'string') {
     return c.json({ error: 'service_type is required' }, 400);
   }
+  const costFields = ['estimated_cost_low', 'estimated_cost_high'];
+  for (const cf of costFields) {
+    if (b[cf] !== undefined && b[cf] !== null) { const v = Number(b[cf]); if (isNaN(v) || v < 0 || v > 9999999) return c.json({ error: `${cf} must be between 0 and 9999999` }, 400); }
+  }
+  if (b.scheduled_date && !/^\d{4}-\d{2}-\d{2}$/.test(b.scheduled_date)) return c.json({ error: 'scheduled_date must be YYYY-MM-DD' }, 400);
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO jobs (id, customer_id, title, description, service_type, status, estimated_cost_low, estimated_cost_high, address, city, is_outdoor, scheduled_date, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
   ).bind(id, b.customer_id || null, sanitize(b.title), sanitize(b.description || ''), sanitize(b.service_type || ''), b.status || 'estimate',
-    b.estimated_cost_low || null, b.estimated_cost_high || null, sanitize(b.address || ''), sanitize(b.city || ''), b.is_outdoor || 0, b.scheduled_date || null, sanitize(b.notes || '')
+    b.estimated_cost_low || null, b.estimated_cost_high || null, sanitize(maxLen(b.address || '', 500)), sanitize(maxLen(b.city || '', 100)), b.is_outdoor || 0, b.scheduled_date || null, sanitize(maxLen(b.notes || '', 2000))
   ).run();
   return c.json({ id });
 });
@@ -414,12 +423,22 @@ app.put('/jobs/:id', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  const numericFields = ['estimated_cost_low', 'estimated_cost_high', 'actual_cost', 'labor_cost', 'materials_cost'];
+  for (const nf of numericFields) {
+    if (b[nf] !== undefined && b[nf] !== null) { const v = Number(b[nf]); if (isNaN(v) || v < 0 || v > 9999999) return c.json({ error: `${nf} must be between 0 and 9999999` }, 400); }
+  }
+  const dateFields = ['scheduled_date', 'start_date', 'completion_date'];
+  for (const df of dateFields) {
+    if (b[df] !== undefined && b[df] !== null && !/^\d{4}-\d{2}-\d{2}$/.test(b[df])) return c.json({ error: `${df} must be YYYY-MM-DD` }, 400);
+  }
+  const validStatuses = ['estimate', 'quote_sent', 'approved', 'scheduled', 'in_progress', 'completed', 'cancelled', 'on_hold'];
+  if (b.status !== undefined && !validStatuses.includes(b.status)) return c.json({ error: 'Invalid status' }, 400);
   const fields = ['title', 'description', 'service_type', 'status', 'estimated_cost_low', 'estimated_cost_high', 'actual_cost',
     'labor_cost', 'materials_cost', 'address', 'city', 'is_outdoor', 'scheduled_date', 'start_date', 'completion_date', 'notes'].filter(f => b[f] !== undefined);
   if (!fields.length) return c.json({ error: 'No fields' }, 400);
   const stringFields = ['title', 'description', 'service_type', 'address', 'city', 'notes'];
   const sets = fields.map(f => `${f} = ?`).join(', ');
-  const vals = fields.map(f => stringFields.includes(f) ? sanitize(b[f]) : b[f]);
+  const vals = fields.map(f => stringFields.includes(f) ? sanitize(maxLen(b[f], 2000)) : b[f]);
   await c.env.DB.prepare(`UPDATE jobs SET ${sets}, updated_at = datetime('now') WHERE id = ?`).bind(...vals, c.req.param('id')).run();
   return c.json({ ok: true });
 });
@@ -494,6 +513,14 @@ app.post('/invoices', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (!b.customer_id || typeof b.customer_id !== 'string') return c.json({ error: 'customer_id is required' }, 400);
+  if (b.subtotal !== undefined) { const v = Number(b.subtotal); if (isNaN(v) || v < 0 || v > 9999999) return c.json({ error: 'subtotal must be between 0 and 9999999' }, 400); }
+  if (b.tax_rate !== undefined) { const v = Number(b.tax_rate); if (isNaN(v) || v < 0 || v > 1) return c.json({ error: 'tax_rate must be between 0 and 1' }, 400); }
+  if (b.issue_date && !/^\d{4}-\d{2}-\d{2}$/.test(b.issue_date)) return c.json({ error: 'issue_date must be YYYY-MM-DD' }, 400);
+  if (b.due_date && !/^\d{4}-\d{2}-\d{2}$/.test(b.due_date)) return c.json({ error: 'due_date must be YYYY-MM-DD' }, 400);
+  const validTerms = ['due_on_receipt', 'net_10', 'net_15', 'net_20', 'net_30', 'net_45', 'net_60'];
+  if (b.payment_terms && !validTerms.includes(b.payment_terms)) return c.json({ error: 'Invalid payment_terms' }, 400);
+  if (b.items && !Array.isArray(b.items)) return c.json({ error: 'items must be an array' }, 400);
   const id = uid();
   const shareToken = crypto.randomUUID();
   const issueDate = b.issue_date || new Date().toISOString().split('T')[0];
@@ -520,11 +547,15 @@ app.post('/invoices', async (c) => {
 
   if (b.items && Array.isArray(b.items)) {
     for (const item of b.items) {
+      const qty = Number(item.quantity || 1);
+      const price = Number(item.unit_price || 0);
+      if (isNaN(qty) || qty < 0 || qty > 99999) continue;
+      if (isNaN(price) || price < 0 || price > 9999999) continue;
       const iid = uid();
-      const itemTotal = (item.quantity || 1) * (item.unit_price || 0);
+      const itemTotal = qty * price;
       await c.env.DB.prepare(
         'INSERT INTO invoice_items (id, invoice_id, description, type, quantity, unit_price, total) VALUES (?, ?, ?, ?, ?, ?, ?)'
-      ).bind(iid, id, sanitize(item.description), item.type || 'labor', item.quantity || 1, item.unit_price || 0, itemTotal).run();
+      ).bind(iid, id, sanitize(maxLen(item.description || '', 500)), item.type || 'labor', qty, price, itemTotal).run();
     }
     await recalcInvoice(c.env.DB, id);
   }
@@ -536,12 +567,23 @@ app.put('/invoices/:id', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  const validStatuses = ['draft', 'sent', 'viewed', 'paid', 'partial', 'overdue', 'void'];
+  if (b.status !== undefined && !validStatuses.includes(b.status)) return c.json({ error: 'Invalid invoice status' }, 400);
+  const validTerms = ['due_on_receipt', 'net_10', 'net_15', 'net_20', 'net_30', 'net_45', 'net_60'];
+  if (b.payment_terms !== undefined && !validTerms.includes(b.payment_terms)) return c.json({ error: 'Invalid payment_terms' }, 400);
+  for (const nf of ['subtotal', 'tax_amount', 'total']) {
+    if (b[nf] !== undefined) { const v = Number(b[nf]); if (isNaN(v) || v < 0 || v > 9999999) return c.json({ error: `${nf} must be between 0 and 9999999` }, 400); }
+  }
+  if (b.tax_rate !== undefined) { const v = Number(b.tax_rate); if (isNaN(v) || v < 0 || v > 1) return c.json({ error: 'tax_rate must be between 0 and 1' }, 400); }
+  for (const df of ['due_date', 'paid_date', 'issue_date']) {
+    if (b[df] !== undefined && b[df] !== null && !/^\d{4}-\d{2}-\d{2}$/.test(b[df])) return c.json({ error: `${df} must be YYYY-MM-DD` }, 400);
+  }
   const allowed = ['status', 'subtotal', 'tax_rate', 'tax_amount', 'total', 'due_date', 'paid_date', 'notes', 'payment_terms', 'sales_rep', 'customer_id', 'issue_date'];
   const fields = allowed.filter(f => b[f] !== undefined);
   if (!fields.length) return c.json({ error: 'No fields' }, 400);
   const stringFields = ['notes', 'sales_rep'];
   const sets = fields.map(f => `${f} = ?`).join(', ');
-  const vals = fields.map(f => stringFields.includes(f) ? sanitize(b[f]) : b[f]);
+  const vals = fields.map(f => stringFields.includes(f) ? sanitize(maxLen(b[f], 2000)) : b[f]);
   await c.env.DB.prepare(`UPDATE invoices SET ${sets}, updated_at = datetime('now') WHERE id = ?`).bind(...vals, c.req.param('id')).run();
   if (b.tax_rate !== undefined) await recalcInvoice(c.env.DB, c.req.param('id'));
   return c.json({ ok: true });
@@ -625,11 +667,16 @@ app.post('/invoices/:id/items', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  const qty = Number(b.quantity || 1);
+  const price = Number(b.unit_price || 0);
+  if (isNaN(qty) || qty < 0 || qty > 99999) return c.json({ error: 'quantity must be between 0 and 99999' }, 400);
+  if (isNaN(price) || price < 0 || price > 9999999) return c.json({ error: 'unit_price must be between 0 and 9999999' }, 400);
+  if (b.type && !['labor', 'material', 'other'].includes(b.type)) return c.json({ error: 'type must be labor, material, or other' }, 400);
   const iid = uid();
-  const itemTotal = (b.quantity || 1) * (b.unit_price || 0);
+  const itemTotal = qty * price;
   await c.env.DB.prepare(
     'INSERT INTO invoice_items (id, invoice_id, description, type, quantity, unit_price, total) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).bind(iid, c.req.param('id'), sanitize(b.description), b.type || 'labor', b.quantity || 1, b.unit_price || 0, itemTotal).run();
+  ).bind(iid, c.req.param('id'), sanitize(maxLen(b.description || '', 500)), b.type || 'labor', qty, price, itemTotal).run();
   await recalcInvoice(c.env.DB, c.req.param('id'));
   return c.json({ id: iid, total: itemTotal });
 });
@@ -841,10 +888,16 @@ app.post('/appointments', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (!b.title || typeof b.title !== 'string' || b.title.trim().length < 2) return c.json({ error: 'title is required (min 2 chars)' }, 400);
+  if (!b.date || !/^\d{4}-\d{2}-\d{2}$/.test(b.date)) return c.json({ error: 'date is required in YYYY-MM-DD format' }, 400);
+  if (b.time_start && !/^\d{2}:\d{2}$/.test(b.time_start)) return c.json({ error: 'time_start must be HH:MM' }, 400);
+  if (b.time_end && !/^\d{2}:\d{2}$/.test(b.time_end)) return c.json({ error: 'time_end must be HH:MM' }, 400);
+  const validStatuses = ['scheduled', 'confirmed', 'completed', 'cancelled', 'no_show'];
+  if (b.status && !validStatuses.includes(b.status)) return c.json({ error: 'Invalid status' }, 400);
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO appointments (id, customer_id, job_id, title, description, service_type, date, time_start, time_end, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, b.customer_id || null, b.job_id || null, sanitize(b.title), sanitize(b.description || ''), sanitize(b.service_type || ''), b.date, b.time_start || null, b.time_end || null, b.status || 'scheduled').run();
+  ).bind(id, b.customer_id || null, b.job_id || null, sanitize(maxLen(b.title, 300)), sanitize(maxLen(b.description || '', 2000)), sanitize(maxLen(b.service_type || '', 100)), b.date, b.time_start || null, b.time_end || null, b.status || 'scheduled').run();
   return c.json({ id });
 });
 
@@ -852,10 +905,16 @@ app.put('/appointments/:id', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (b.date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(b.date)) return c.json({ error: 'date must be YYYY-MM-DD' }, 400);
+  if (b.time_start !== undefined && b.time_start !== null && !/^\d{2}:\d{2}$/.test(b.time_start)) return c.json({ error: 'time_start must be HH:MM' }, 400);
+  if (b.time_end !== undefined && b.time_end !== null && !/^\d{2}:\d{2}$/.test(b.time_end)) return c.json({ error: 'time_end must be HH:MM' }, 400);
+  const validStatuses = ['scheduled', 'confirmed', 'completed', 'cancelled', 'no_show'];
+  if (b.status !== undefined && !validStatuses.includes(b.status)) return c.json({ error: 'Invalid status' }, 400);
   const fields = ['title', 'date', 'time_start', 'time_end', 'status', 'weather_alert'].filter(f => b[f] !== undefined);
   if (!fields.length) return c.json({ error: 'No fields' }, 400);
+  const stringFields = ['title'];
   const sets = fields.map(f => `${f} = ?`).join(', ');
-  const vals = fields.map(f => b[f]);
+  const vals = fields.map(f => stringFields.includes(f) ? sanitize(maxLen(b[f], 300)) : b[f]);
   await c.env.DB.prepare(`UPDATE appointments SET ${sets} WHERE id = ?`).bind(...vals, c.req.param('id')).run();
   return c.json({ ok: true });
 });
@@ -1055,6 +1114,8 @@ app.post('/blog', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (!b.title || typeof b.title !== 'string' || b.title.trim().length < 3) return c.json({ error: 'title is required (min 3 chars)' }, 400);
+  if (b.status && !['draft', 'published', 'archived'].includes(b.status)) return c.json({ error: 'Invalid status' }, 400);
   const id = uid();
   const slug = (b.title || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   // Blog content is admin-authored HTML — sanitize title/excerpt/tags but preserve content HTML
@@ -1084,7 +1145,10 @@ app.put('/blog/:id', async (c) => {
   if (b.author !== undefined) { fields.push('author = ?'); vals.push(sanitize(b.author)); }
   if (b.seo_title !== undefined) { fields.push('seo_title = ?'); vals.push(sanitize(b.seo_title)); }
   if (b.seo_description !== undefined) { fields.push('seo_description = ?'); vals.push(sanitize(b.seo_description)); }
-  if (b.status !== undefined) { fields.push('status = ?'); vals.push(b.status); }
+  if (b.status !== undefined) {
+    if (!['draft', 'published', 'archived'].includes(b.status)) return c.json({ error: 'Invalid status' }, 400);
+    fields.push('status = ?'); vals.push(b.status);
+  }
   if (!fields.length) return c.json({ error: 'No fields to update' }, 400);
   fields.push("updated_at = datetime('now')");
   vals.push(c.req.param('id'));
@@ -1180,10 +1244,19 @@ app.post('/promotions', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (!b.title || typeof b.title !== 'string' || b.title.trim().length < 2) return c.json({ error: 'title is required' }, 400);
+  if (b.discount_type && !['percent', 'fixed'].includes(b.discount_type)) return c.json({ error: 'discount_type must be percent or fixed' }, 400);
+  const dv = Number(b.discount_value || 10);
+  if (isNaN(dv) || dv < 0 || dv > 999999) return c.json({ error: 'discount_value out of range' }, 400);
+  if (b.discount_type === 'percent' && dv > 100) return c.json({ error: 'percent discount cannot exceed 100' }, 400);
+  for (const df of ['start_date', 'end_date']) {
+    if (b[df] && !/^\d{4}-\d{2}-\d{2}$/.test(b[df])) return c.json({ error: `${df} must be YYYY-MM-DD` }, 400);
+  }
+  if (b.start_date && b.end_date && b.end_date < b.start_date) return c.json({ error: 'end_date must be after start_date' }, 400);
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO promotions (id, title, description, discount_type, discount_value, promo_code, active, start_date, end_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, b.title, b.description || null, b.discount_type || 'percent', b.discount_value || 10, b.promo_code || null, b.active || 0, b.start_date || null, b.end_date || null).run();
+  ).bind(id, sanitize(maxLen(b.title, 200)), sanitize(maxLen(b.description || '', 1000)), b.discount_type || 'percent', dv, sanitize(maxLen(b.promo_code || '', 50)), b.active || 0, b.start_date || null, b.end_date || null).run();
   return c.json({ id });
 });
 
@@ -1926,10 +1999,16 @@ app.post('/change-orders', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (!b.job_id || typeof b.job_id !== 'string') return c.json({ error: 'job_id is required' }, 400);
+  if (!b.title || typeof b.title !== 'string' || b.title.trim().length < 2) return c.json({ error: 'title is required' }, 400);
+  const ci = Number(b.cost_impact || 0);
+  if (isNaN(ci) || ci < -9999999 || ci > 9999999) return c.json({ error: 'cost_impact out of range' }, 400);
+  const ti = Number(b.time_impact_days || 0);
+  if (isNaN(ti) || !Number.isInteger(ti) || ti < -365 || ti > 365) return c.json({ error: 'time_impact_days must be integer between -365 and 365' }, 400);
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO change_orders (id, job_id, title, description, reason, cost_impact, time_impact_days, requested_by) VALUES (?,?,?,?,?,?,?,?)'
-  ).bind(id, b.job_id, sanitize(b.title), sanitize(b.description || ''), sanitize(b.reason || ''), b.cost_impact || 0, b.time_impact_days || 0, sanitize(b.requested_by || 'Adam')).run();
+  ).bind(id, b.job_id, sanitize(maxLen(b.title, 300)), sanitize(maxLen(b.description || '', 2000)), sanitize(maxLen(b.reason || '', 1000)), ci, ti, sanitize(maxLen(b.requested_by || 'Adam', 200))).run();
   return c.json({ ok: true, id }, 201);
 });
 
@@ -1940,11 +2019,19 @@ app.put('/change-orders/:id', async (c) => {
   const b = await c.req.json();
   const sets: string[] = [];
   const vals: any[] = [];
-  if (b.status !== undefined) { sets.push('status = ?'); vals.push(b.status); }
-  if (b.approved_by !== undefined) { sets.push('approved_by = ?'); vals.push(sanitize(b.approved_by)); }
+  const validCoStatuses = ['pending', 'approved', 'rejected'];
+  if (b.status !== undefined) {
+    if (!validCoStatuses.includes(b.status)) return c.json({ error: 'status must be pending, approved, or rejected' }, 400);
+    sets.push('status = ?'); vals.push(b.status);
+  }
+  if (b.approved_by !== undefined) { sets.push('approved_by = ?'); vals.push(sanitize(maxLen(b.approved_by, 200))); }
   if (b.status === 'approved') { sets.push("approved_at = datetime('now')"); }
-  if (b.cost_impact !== undefined) { sets.push('cost_impact = ?'); vals.push(b.cost_impact); }
-  if (b.description !== undefined) { sets.push('description = ?'); vals.push(sanitize(b.description)); }
+  if (b.cost_impact !== undefined) {
+    const ci = Number(b.cost_impact);
+    if (isNaN(ci) || ci < -9999999 || ci > 9999999) return c.json({ error: 'cost_impact out of range' }, 400);
+    sets.push('cost_impact = ?'); vals.push(ci);
+  }
+  if (b.description !== undefined) { sets.push('description = ?'); vals.push(sanitize(maxLen(b.description, 2000))); }
   sets.push("updated_at = datetime('now')");
   vals.push(id);
   await c.env.DB.prepare(`UPDATE change_orders SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run();
@@ -1979,10 +2066,14 @@ app.post('/materials', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (!b.name || typeof b.name !== 'string' || b.name.trim().length < 1) return c.json({ error: 'name is required' }, 400);
+  for (const nf of ['unit_cost', 'quantity_on_hand', 'reorder_level']) {
+    if (b[nf] !== undefined) { const v = Number(b[nf]); if (isNaN(v) || v < 0 || v > 9999999) return c.json({ error: `${nf} must be between 0 and 9999999` }, 400); }
+  }
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO materials (id, name, category, unit, unit_cost, quantity_on_hand, reorder_level, preferred_vendor, sku, notes) VALUES (?,?,?,?,?,?,?,?,?,?)'
-  ).bind(id, sanitize(b.name), b.category || 'wood', b.unit || 'board_ft', b.unit_cost || 0, b.quantity_on_hand || 0, b.reorder_level || 0, sanitize(b.preferred_vendor || ''), sanitize(b.sku || ''), sanitize(b.notes || '')).run();
+  ).bind(id, sanitize(maxLen(b.name, 200)), sanitize(maxLen(b.category || 'wood', 100)), sanitize(maxLen(b.unit || 'board_ft', 50)), b.unit_cost || 0, b.quantity_on_hand || 0, b.reorder_level || 0, sanitize(maxLen(b.preferred_vendor || '', 200)), sanitize(maxLen(b.sku || '', 100)), sanitize(maxLen(b.notes || '', 1000))).run();
   return c.json({ ok: true, id }, 201);
 });
 
@@ -1997,7 +2088,7 @@ app.put('/materials/:id', async (c) => {
     if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(sanitize(b[k])); }
   }
   for (const k of ['unit_cost', 'quantity_on_hand', 'reorder_level']) {
-    if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(b[k]); }
+    if (b[k] !== undefined) { const v = Number(b[k]); if (isNaN(v) || v < 0 || v > 9999999) return c.json({ error: `${k} must be between 0 and 9999999` }, 400); sets.push(`${k} = ?`); vals.push(v); }
   }
   sets.push("updated_at = datetime('now')");
   vals.push(id);
@@ -2125,10 +2216,12 @@ app.post('/portfolio', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (!b.title || typeof b.title !== 'string' || b.title.trim().length < 2) return c.json({ error: 'title is required' }, 400);
+  if (b.display_order !== undefined) { const v = Number(b.display_order); if (isNaN(v) || v < 0 || v > 9999) return c.json({ error: 'display_order must be 0-9999' }, 400); }
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO portfolio (id, job_id, title, description, category, before_photo_url, after_photo_url, additional_photos, featured, display_order, published) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
-  ).bind(id, b.job_id || null, sanitize(b.title), sanitize(b.description || ''), b.category || 'custom_carpentry', b.before_photo_url || '', b.after_photo_url || '', b.additional_photos || '', b.featured ? 1 : 0, b.display_order || 0, b.published ? 1 : 0).run();
+  ).bind(id, b.job_id || null, sanitize(maxLen(b.title, 300)), sanitize(maxLen(b.description || '', 2000)), sanitize(maxLen(b.category || 'custom_carpentry', 100)), maxLen(b.before_photo_url || '', 2000), maxLen(b.after_photo_url || '', 2000), maxLen(b.additional_photos || '', 5000), b.featured ? 1 : 0, b.display_order || 0, b.published ? 1 : 0).run();
   return c.json({ ok: true, id }, 201);
 });
 
@@ -2178,10 +2271,14 @@ app.post('/qc', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (!b.job_id || typeof b.job_id !== 'string') return c.json({ error: 'job_id is required' }, 400);
+  const validTypes = ['final_walkthrough', 'rough_inspection', 'finish_inspection', 'punch_list', 'safety_check'];
+  if (b.type && !validTypes.includes(b.type)) return c.json({ error: 'Invalid QC type' }, 400);
+  if (b.items && !Array.isArray(b.items)) return c.json({ error: 'items must be an array' }, 400);
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO qc_checklists (id, job_id, type, items, completed_by, notes) VALUES (?,?,?,?,?,?)'
-  ).bind(id, b.job_id, b.type || 'final_walkthrough', JSON.stringify(b.items || []), sanitize(b.completed_by || 'Adam'), sanitize(b.notes || '')).run();
+  ).bind(id, b.job_id, b.type || 'final_walkthrough', JSON.stringify(b.items || []), sanitize(maxLen(b.completed_by || 'Adam', 200)), sanitize(maxLen(b.notes || '', 2000))).run();
   return c.json({ ok: true, id }, 201);
 });
 
