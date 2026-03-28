@@ -28,3 +28,8 @@ service = "echo-document-delivery"
 [[analytics_engine_datasets]]
 binding = "ANALYTICS"
 dataset = "echo_metrics"
+
+# Daily automation: appointment reminders, overdue invoices, follow-ups
+# Runs at 8 AM CST (14:00 UTC)
+[triggers]
+crons = ["0 14 * * *"]

@@ -137,7 +137,7 @@ function cached(c: any, data: any, maxAge = 300) {
 
 // ─── Notification Logging ─────────────────────────────────
 type NotifChannel = 'sms' | 'email' | 'call';
-type NotifContext = 'booking_owner' | 'booking_customer' | 'review_request' | 'review_notify' | 'invoice_send' | 'twilio_direct' | 'twilio_call';
+type NotifContext = 'booking_owner' | 'booking_customer' | 'review_request' | 'review_notify' | 'invoice_send' | 'twilio_direct' | 'twilio_call' | 'appt_reminder' | 'overdue_invoice' | 'follow_up_auto';
 
 async function logNotification(
   db: D1Database,
@@ -208,7 +208,7 @@ async function sendEmail(
 }
 
 // ─── Health ──────────────────────────────────────────────
-app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.7.0', status: 'ok' }));
+app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.8.0', status: 'ok' }));
 app.get('/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }));
 
 // ─── 404 Error Tracking (receives beacons from 404.html) ──
@@ -2701,4 +2701,164 @@ app.notFound((c) => {
   return c.json({ error: 'Not found' }, 404);
 });
 
-export default app;
+// ─── Scheduled Automation ─────────────────────────────────
+// Runs daily at 8 AM CST (14:00 UTC) via cron trigger
+
+async function handleScheduled(env: Env): Promise<void> {
+  const db = env.DB;
+  const results: string[] = [];
+
+  // 1. APPOINTMENT REMINDERS — SMS to customers with appointments tomorrow
+  try {
+    const tomorrow = new Date();
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    const tomorrowStr = tomorrow.toISOString().slice(0, 10);
+
+    const appts = await db.prepare(
+      `SELECT a.id, a.title, a.date, a.time_start, a.customer_id,
+              c.name as customer_name, c.phone as customer_phone, c.email as customer_email
+       FROM appointments a
+       LEFT JOIN customers c ON a.customer_id = c.id
+       WHERE a.date = ? AND a.status IN ('scheduled', 'confirmed')`
+    ).bind(tomorrowStr).all();
+
+    let smsCount = 0;
+    let emailCount = 0;
+    for (const appt of (appts.results || []) as any[]) {
+      const timeStr = appt.time_start ? ` at ${appt.time_start}` : '';
+      const msg = `Hi ${appt.customer_name || 'there'}! This is a friendly reminder from Pro Finish Custom Carpentry — you have an appointment${timeStr} tomorrow (${appt.date}). ${appt.title ? `Service: ${appt.title}. ` : ''}If you need to reschedule, call us at (432) 466-5310. See you then!`;
+
+      if (appt.customer_phone) {
+        await sendSms(env, db, appt.customer_phone, msg, 'appt_reminder');
+        smsCount++;
+      }
+      if (appt.customer_email) {
+        await sendEmail(env, db, appt.customer_email,
+          `Pro Finish Custom Carpentry <${env.COMPANY_EMAIL || 'noreply@profinishusa.com'}>`,
+          `Appointment Reminder — ${appt.date}`,
+          `<div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+            <h2 style="color:#1a365d">Appointment Reminder</h2>
+            <p>Hi ${sanitize(appt.customer_name || 'there')},</p>
+            <p>Just a reminder that you have an appointment with Pro Finish Custom Carpentry <strong>tomorrow, ${appt.date}${timeStr}</strong>.</p>
+            ${appt.title ? `<p><strong>Service:</strong> ${sanitize(appt.title)}</p>` : ''}
+            <p>If you need to reschedule, please call us at <a href="tel:+14324665310">(432) 466-5310</a>.</p>
+            <p>See you then!</p>
+            <p style="color:#64748b;font-size:.85rem;margin-top:24px">Pro Finish Custom Carpentry &bull; Big Spring, TX</p>
+          </div>`,
+          'appt_reminder');
+        emailCount++;
+      }
+    }
+    results.push(`appt_reminders: ${smsCount} sms, ${emailCount} email for ${(appts.results || []).length} appointments`);
+  } catch (e: any) {
+    results.push(`appt_reminders: error — ${e.message}`);
+  }
+
+  // 2. OVERDUE INVOICE FLAGGING — mark sent invoices as overdue if past due_date
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const overdue = await db.prepare(
+      `UPDATE invoices SET status = 'overdue' WHERE status = 'sent' AND due_date < ? AND due_date IS NOT NULL`
+    ).bind(today).run();
+    const flagged = overdue.meta?.changes || 0;
+    results.push(`overdue_invoices: ${flagged} flagged`);
+
+    // Notify owner about overdue invoices
+    if (flagged > 0) {
+      const overdueList = await db.prepare(
+        `SELECT i.id, i.invoice_number, i.subtotal, i.due_date, c.name as customer_name
+         FROM invoices i LEFT JOIN customers c ON i.customer_id = c.id
+         WHERE i.status = 'overdue' ORDER BY i.due_date ASC LIMIT 10`
+      ).all();
+
+      const summary = (overdueList.results || []).map((inv: any) =>
+        `• ${inv.invoice_number || inv.id} — ${inv.customer_name || 'Unknown'} — $${inv.subtotal || 0} (due ${inv.due_date})`
+      ).join('\n');
+
+      if (env.OWNER_PHONE) {
+        await sendSms(env, db, env.OWNER_PHONE,
+          `ProFinish: ${flagged} invoice(s) now overdue:\n${summary}\n\nView at profinishusa.com/owner.html`,
+          'overdue_invoice');
+      }
+    }
+  } catch (e: any) {
+    results.push(`overdue_invoices: error — ${e.message}`);
+  }
+
+  // 3. FOLLOW-UP EXECUTION — process scheduled follow-ups that are due
+  try {
+    const now = new Date().toISOString();
+    const dueFollowUps = await db.prepare(
+      `SELECT f.id, f.customer_id, f.type, f.step, f.channel, f.message,
+              c.name as customer_name, c.phone as customer_phone, c.email as customer_email
+       FROM follow_ups f
+       LEFT JOIN customers c ON f.customer_id = c.id
+       WHERE f.status = 'pending' AND f.scheduled_at <= ?
+       ORDER BY f.scheduled_at ASC LIMIT 20`
+    ).bind(now).all();
+
+    let executed = 0;
+    for (const fu of (dueFollowUps.results || []) as any[]) {
+      const msg = fu.message || `Hi ${fu.customer_name || 'there'}, this is Adam from Pro Finish Custom Carpentry. Just following up — let me know if you have any questions about your project! (432) 466-5310`;
+
+      let sent = false;
+      if (fu.channel === 'sms' && fu.customer_phone) {
+        const r = await sendSms(env, db, fu.customer_phone, msg, 'follow_up_auto');
+        sent = r.ok;
+      } else if (fu.channel === 'email' && fu.customer_email) {
+        const r = await sendEmail(env, db, fu.customer_email,
+          `Adam at Pro Finish <${env.COMPANY_EMAIL || 'noreply@profinishusa.com'}>`,
+          'Following up on your project',
+          `<div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+            <p>Hi ${sanitize(fu.customer_name || 'there')},</p>
+            <p>${sanitize(msg)}</p>
+            <p>Best,<br>Adam<br>Pro Finish Custom Carpentry<br>(432) 466-5310</p>
+          </div>`,
+          'follow_up_auto');
+        sent = r.ok;
+      }
+
+      await db.prepare(
+        `UPDATE follow_ups SET status = ?, completed_at = datetime('now') WHERE id = ?`
+      ).bind(sent ? 'completed' : 'failed', fu.id).run();
+      if (sent) executed++;
+    }
+    results.push(`follow_ups: ${executed}/${(dueFollowUps.results || []).length} executed`);
+  } catch (e: any) {
+    results.push(`follow_ups: error — ${e.message}`);
+  }
+
+  // 4. STALE JOB CLEANUP — jobs stuck in 'estimate' for 30+ days get flagged
+  try {
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setUTCDate(thirtyDaysAgo.getUTCDate() - 30);
+    const staleDate = thirtyDaysAgo.toISOString().slice(0, 10);
+
+    const stale = await db.prepare(
+      `SELECT COUNT(*) as cnt FROM jobs WHERE status = 'estimate' AND created_at < ?`
+    ).bind(staleDate).first<{ cnt: number }>();
+
+    if (stale && stale.cnt > 0) {
+      results.push(`stale_estimates: ${stale.cnt} older than 30 days`);
+    } else {
+      results.push('stale_estimates: 0');
+    }
+  } catch (e: any) {
+    results.push(`stale_estimates: error — ${e.message}`);
+  }
+
+  console.log(JSON.stringify({
+    level: 'info',
+    worker: 'profinish-api',
+    event: 'scheduled_run',
+    timestamp: new Date().toISOString(),
+    results,
+  }));
+}
+
+export default {
+  fetch: app.fetch,
+  scheduled: async (event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
+    ctx.waitUntil(handleScheduled(env));
+  },
+};
