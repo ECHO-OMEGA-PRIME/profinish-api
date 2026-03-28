@@ -129,6 +129,13 @@ app.get('/customers/:id', async (c) => {
 
 app.post('/customers', async (c) => {
   const body = await c.req.json();
+  // Validate required fields
+  if (!body.name || typeof body.name !== 'string' || body.name.trim().length < 2) {
+    return c.json({ error: 'name is required (min 2 characters)' }, 400);
+  }
+  if (body.email && typeof body.email === 'string' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) {
+    return c.json({ error: 'invalid email format' }, 400);
+  }
   const id = uid();
   const refCode = 'PF' + id.slice(0, 6).toUpperCase();
   await c.env.DB.prepare(
@@ -167,6 +174,8 @@ app.get('/jobs', async (c) => {
 });
 
 app.get('/jobs/:id', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
   const row = await c.env.DB.prepare('SELECT j.*, c.name as customer_name FROM jobs j LEFT JOIN customers c ON j.customer_id = c.id WHERE j.id = ?').bind(c.req.param('id')).first();
   return row ? c.json(row) : c.json({ error: 'Not found' }, 404);
 });
@@ -439,10 +448,18 @@ app.get('/reviews', async (c) => {
 
 app.post('/reviews', async (c) => {
   const b = await c.req.json();
+  // Validate rating range (1-5 stars)
+  const rating = Number(b.rating);
+  if (!rating || rating < 1 || rating > 5 || !Number.isInteger(rating)) {
+    return c.json({ error: 'rating must be an integer between 1 and 5' }, 400);
+  }
+  if (!b.text || typeof b.text !== 'string' || b.text.trim().length < 5) {
+    return c.json({ error: 'review text is required (min 5 characters)' }, 400);
+  }
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO reviews (id, customer_id, job_id, rating, text, photo_url, approved) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, b.customer_id || null, b.job_id || null, b.rating, sanitize(b.text || ''), b.photo_url || null, 0).run();
+  ).bind(id, b.customer_id || null, b.job_id || null, rating, sanitize(b.text), b.photo_url || null, 0).run();
   return c.json({ id });
 });
 
@@ -502,6 +519,9 @@ app.post('/chat/session', async (c) => {
 });
 
 app.put('/chat/session/:id', async (c) => {
+  // Require auth — prevent unauthorized chat message modification
+  const denied = requireAuth(c);
+  if (denied) return denied;
   const b = await c.req.json();
   await c.env.DB.prepare(
     'UPDATE chat_sessions SET messages = ?, emotion_log = ?, summary = ?, updated_at = datetime("now") WHERE id = ?'
@@ -722,14 +742,19 @@ app.post('/promotions', async (c) => {
 // ─── NPS ─────────────────────────────────────────────────
 app.post('/nps', async (c) => {
   const b = await c.req.json();
+  // Validate NPS score range (0-10)
+  const score = Number(b.score);
+  if (isNaN(score) || score < 0 || score > 10 || !Number.isInteger(score)) {
+    return c.json({ error: 'score must be an integer between 0 and 10' }, 400);
+  }
   const id = uid();
   let action = 'none';
-  if (b.score >= 9) action = 'ask_google_review';
-  else if (b.score >= 7) action = 'ask_improvement';
+  if (score >= 9) action = 'ask_google_review';
+  else if (score >= 7) action = 'ask_improvement';
   else action = 'alert_adam';
   await c.env.DB.prepare(
     'INSERT INTO nps_responses (id, customer_id, job_id, score, comment, follow_up_action) VALUES (?, ?, ?, ?, ?, ?)'
-  ).bind(id, b.customer_id || null, b.job_id || null, b.score, sanitize(b.comment || ''), action).run();
+  ).bind(id, b.customer_id || null, b.job_id || null, score, sanitize(b.comment || ''), action).run();
   return c.json({ id, follow_up_action: action });
 });
 
