@@ -350,3 +350,113 @@ CREATE INDEX IF NOT EXISTS idx_follow_ups_scheduled ON follow_ups(scheduled_at);
 CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
 CREATE INDEX IF NOT EXISTS idx_time_entries_job ON time_entries(job_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_job ON expenses(job_id);
+
+-- ═══ Change Orders (scope changes during a job) ═══
+CREATE TABLE IF NOT EXISTS change_orders (
+  id TEXT PRIMARY KEY,
+  job_id TEXT REFERENCES jobs(id),
+  title TEXT NOT NULL,
+  description TEXT,
+  reason TEXT,
+  cost_impact REAL DEFAULT 0,
+  time_impact_days INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'pending',
+  requested_by TEXT,
+  approved_by TEXT,
+  approved_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_change_orders_job ON change_orders(job_id);
+CREATE INDEX IF NOT EXISTS idx_change_orders_status ON change_orders(status);
+
+-- ═══ Materials Inventory ═══
+CREATE TABLE IF NOT EXISTS materials (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  category TEXT DEFAULT 'wood',
+  unit TEXT DEFAULT 'board_ft',
+  unit_cost REAL DEFAULT 0,
+  quantity_on_hand REAL DEFAULT 0,
+  reorder_level REAL DEFAULT 0,
+  preferred_vendor TEXT,
+  sku TEXT,
+  notes TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_materials_category ON materials(category);
+
+-- ═══ Material Usage per Job ═══
+CREATE TABLE IF NOT EXISTS material_usage (
+  id TEXT PRIMARY KEY,
+  job_id TEXT REFERENCES jobs(id),
+  material_id TEXT REFERENCES materials(id),
+  quantity_used REAL NOT NULL,
+  cost_at_time REAL,
+  notes TEXT,
+  used_date TEXT DEFAULT (date('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_material_usage_job ON material_usage(job_id);
+
+-- ═══ Warranties ═══
+CREATE TABLE IF NOT EXISTS warranties (
+  id TEXT PRIMARY KEY,
+  job_id TEXT REFERENCES jobs(id),
+  customer_id TEXT REFERENCES customers(id),
+  type TEXT DEFAULT 'workmanship',
+  duration_months INTEGER DEFAULT 12,
+  start_date TEXT,
+  end_date TEXT,
+  terms TEXT,
+  status TEXT DEFAULT 'active',
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_warranties_job ON warranties(job_id);
+CREATE INDEX IF NOT EXISTS idx_warranties_status ON warranties(status);
+
+-- ═══ Warranty Claims ═══
+CREATE TABLE IF NOT EXISTS warranty_claims (
+  id TEXT PRIMARY KEY,
+  warranty_id TEXT REFERENCES warranties(id),
+  description TEXT NOT NULL,
+  photo_urls TEXT,
+  status TEXT DEFAULT 'submitted',
+  resolution TEXT,
+  resolved_at TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_warranty_claims_warranty ON warranty_claims(warranty_id);
+
+-- ═══ Portfolio Gallery (Before/After) ═══
+CREATE TABLE IF NOT EXISTS portfolio (
+  id TEXT PRIMARY KEY,
+  job_id TEXT REFERENCES jobs(id),
+  title TEXT NOT NULL,
+  description TEXT,
+  category TEXT DEFAULT 'custom_carpentry',
+  before_photo_url TEXT,
+  after_photo_url TEXT,
+  additional_photos TEXT,
+  featured INTEGER DEFAULT 0,
+  display_order INTEGER DEFAULT 0,
+  published INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_portfolio_published ON portfolio(published);
+CREATE INDEX IF NOT EXISTS idx_portfolio_category ON portfolio(category);
+
+-- ═══ QC Checklists ═══
+CREATE TABLE IF NOT EXISTS qc_checklists (
+  id TEXT PRIMARY KEY,
+  job_id TEXT REFERENCES jobs(id),
+  type TEXT DEFAULT 'final_walkthrough',
+  items TEXT NOT NULL,
+  completed_by TEXT,
+  customer_signed INTEGER DEFAULT 0,
+  customer_signature_url TEXT,
+  notes TEXT,
+  completed_at TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_qc_checklists_job ON qc_checklists(job_id);

@@ -1331,4 +1331,334 @@ app.put('/documents/settings', async (c) => {
   return c.json(await resp.json(), resp.status as any);
 });
 
+// ═══ Change Orders ═══════════════════════════════════════
+app.get('/change-orders', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const jobId = c.req.query('job_id');
+  const sql = jobId
+    ? 'SELECT co.*, j.title as job_title FROM change_orders co LEFT JOIN jobs j ON co.job_id = j.id WHERE co.job_id = ? ORDER BY co.created_at DESC'
+    : 'SELECT co.*, j.title as job_title FROM change_orders co LEFT JOIN jobs j ON co.job_id = j.id ORDER BY co.created_at DESC';
+  const rows = jobId ? await c.env.DB.prepare(sql).bind(jobId).all() : await c.env.DB.prepare(sql).all();
+  return c.json(rows.results);
+});
+
+app.post('/change-orders', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+  const id = uid();
+  await c.env.DB.prepare(
+    'INSERT INTO change_orders (id, job_id, title, description, reason, cost_impact, time_impact_days, requested_by) VALUES (?,?,?,?,?,?,?,?)'
+  ).bind(id, b.job_id, sanitize(b.title), sanitize(b.description || ''), sanitize(b.reason || ''), b.cost_impact || 0, b.time_impact_days || 0, sanitize(b.requested_by || 'Adam')).run();
+  return c.json({ ok: true, id }, 201);
+});
+
+app.put('/change-orders/:id', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const { id } = c.req.param();
+  const b = await c.req.json();
+  const sets: string[] = [];
+  const vals: any[] = [];
+  if (b.status !== undefined) { sets.push('status = ?'); vals.push(b.status); }
+  if (b.approved_by !== undefined) { sets.push('approved_by = ?'); vals.push(sanitize(b.approved_by)); }
+  if (b.status === 'approved') { sets.push("approved_at = datetime('now')"); }
+  if (b.cost_impact !== undefined) { sets.push('cost_impact = ?'); vals.push(b.cost_impact); }
+  if (b.description !== undefined) { sets.push('description = ?'); vals.push(sanitize(b.description)); }
+  sets.push("updated_at = datetime('now')");
+  vals.push(id);
+  await c.env.DB.prepare(`UPDATE change_orders SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run();
+  // If approved, update the job's estimated cost
+  if (b.status === 'approved') {
+    const co = await c.env.DB.prepare('SELECT job_id, cost_impact FROM change_orders WHERE id = ?').bind(id).first() as any;
+    if (co?.job_id && co.cost_impact) {
+      await c.env.DB.prepare('UPDATE jobs SET estimated_cost_high = COALESCE(estimated_cost_high, 0) + ?, updated_at = datetime("now") WHERE id = ?').bind(co.cost_impact, co.job_id).run();
+    }
+  }
+  return c.json({ ok: true });
+});
+
+// ═══ Materials Inventory ═════════════════════════════════
+app.get('/materials', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const cat = c.req.query('category');
+  const low = c.req.query('low_stock');
+  let sql = 'SELECT * FROM materials';
+  const conditions: string[] = [];
+  const vals: any[] = [];
+  if (cat) { conditions.push('category = ?'); vals.push(cat); }
+  if (low === '1') { conditions.push('quantity_on_hand <= reorder_level'); }
+  if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+  sql += ' ORDER BY name';
+  const rows = await c.env.DB.prepare(sql).bind(...vals).all();
+  return c.json(rows.results);
+});
+
+app.post('/materials', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+  const id = uid();
+  await c.env.DB.prepare(
+    'INSERT INTO materials (id, name, category, unit, unit_cost, quantity_on_hand, reorder_level, preferred_vendor, sku, notes) VALUES (?,?,?,?,?,?,?,?,?,?)'
+  ).bind(id, sanitize(b.name), b.category || 'wood', b.unit || 'board_ft', b.unit_cost || 0, b.quantity_on_hand || 0, b.reorder_level || 0, sanitize(b.preferred_vendor || ''), sanitize(b.sku || ''), sanitize(b.notes || '')).run();
+  return c.json({ ok: true, id }, 201);
+});
+
+app.put('/materials/:id', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const { id } = c.req.param();
+  const b = await c.req.json();
+  const sets: string[] = [];
+  const vals: any[] = [];
+  for (const k of ['name', 'category', 'unit', 'preferred_vendor', 'sku', 'notes']) {
+    if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(sanitize(b[k])); }
+  }
+  for (const k of ['unit_cost', 'quantity_on_hand', 'reorder_level']) {
+    if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(b[k]); }
+  }
+  sets.push("updated_at = datetime('now')");
+  vals.push(id);
+  await c.env.DB.prepare(`UPDATE materials SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run();
+  return c.json({ ok: true });
+});
+
+// Material usage tracking
+app.get('/material-usage', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const jobId = c.req.query('job_id');
+  const sql = jobId
+    ? 'SELECT mu.*, m.name as material_name, m.unit, m.category FROM material_usage mu JOIN materials m ON mu.material_id = m.id WHERE mu.job_id = ? ORDER BY mu.used_date DESC'
+    : 'SELECT mu.*, m.name as material_name, m.unit, m.category FROM material_usage mu JOIN materials m ON mu.material_id = m.id ORDER BY mu.used_date DESC LIMIT 100';
+  const rows = jobId ? await c.env.DB.prepare(sql).bind(jobId).all() : await c.env.DB.prepare(sql).all();
+  return c.json(rows.results);
+});
+
+app.post('/material-usage', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+  const id = uid();
+  // Get current unit cost
+  const mat = await c.env.DB.prepare('SELECT unit_cost, quantity_on_hand FROM materials WHERE id = ?').bind(b.material_id).first() as any;
+  const costAtTime = mat?.unit_cost || 0;
+  await c.env.DB.prepare(
+    'INSERT INTO material_usage (id, job_id, material_id, quantity_used, cost_at_time, notes) VALUES (?,?,?,?,?,?)'
+  ).bind(id, b.job_id, b.material_id, b.quantity_used, costAtTime, sanitize(b.notes || '')).run();
+  // Deduct from inventory
+  if (mat) {
+    await c.env.DB.prepare('UPDATE materials SET quantity_on_hand = MAX(0, quantity_on_hand - ?), updated_at = datetime("now") WHERE id = ?').bind(b.quantity_used, b.material_id).run();
+  }
+  return c.json({ ok: true, id, cost: costAtTime * b.quantity_used }, 201);
+});
+
+// ═══ Warranties ═══════════════════════════════════════════
+app.get('/warranties', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const jobId = c.req.query('job_id');
+  const status = c.req.query('status');
+  let sql = 'SELECT w.*, j.title as job_title, cu.name as customer_name FROM warranties w LEFT JOIN jobs j ON w.job_id = j.id LEFT JOIN customers cu ON w.customer_id = cu.id';
+  const conditions: string[] = [];
+  const vals: any[] = [];
+  if (jobId) { conditions.push('w.job_id = ?'); vals.push(jobId); }
+  if (status) { conditions.push('w.status = ?'); vals.push(status); }
+  if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+  sql += ' ORDER BY w.end_date ASC';
+  const rows = await c.env.DB.prepare(sql).bind(...vals).all();
+  return c.json(rows.results);
+});
+
+app.post('/warranties', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+  const id = uid();
+  const startDate = b.start_date || new Date().toISOString().split('T')[0];
+  const months = b.duration_months || 12;
+  const endDate = new Date(new Date(startDate).getTime() + months * 30.44 * 86400000).toISOString().split('T')[0];
+  await c.env.DB.prepare(
+    'INSERT INTO warranties (id, job_id, customer_id, type, duration_months, start_date, end_date, terms, status) VALUES (?,?,?,?,?,?,?,?,?)'
+  ).bind(id, b.job_id, b.customer_id, b.type || 'workmanship', months, startDate, endDate, sanitize(b.terms || '1-year warranty on all workmanship'), 'active').run();
+  return c.json({ ok: true, id, end_date: endDate }, 201);
+});
+
+// Warranty claims (public — customers can submit)
+app.get('/warranty-claims', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const warrantyId = c.req.query('warranty_id');
+  const sql = warrantyId
+    ? 'SELECT wc.*, w.type as warranty_type, w.job_id FROM warranty_claims wc JOIN warranties w ON wc.warranty_id = w.id WHERE wc.warranty_id = ? ORDER BY wc.created_at DESC'
+    : 'SELECT wc.*, w.type as warranty_type, w.job_id FROM warranty_claims wc JOIN warranties w ON wc.warranty_id = w.id ORDER BY wc.created_at DESC';
+  const rows = warrantyId ? await c.env.DB.prepare(sql).bind(warrantyId).all() : await c.env.DB.prepare(sql).all();
+  return c.json(rows.results);
+});
+
+app.post('/warranty-claims', async (c) => {
+  const b = await c.req.json();
+  const id = uid();
+  // Verify warranty is active
+  const warranty = await c.env.DB.prepare('SELECT * FROM warranties WHERE id = ? AND status = "active"').bind(b.warranty_id).first();
+  if (!warranty) return c.json({ error: 'Warranty not found or expired' }, 404);
+  await c.env.DB.prepare(
+    'INSERT INTO warranty_claims (id, warranty_id, description, photo_urls) VALUES (?,?,?,?)'
+  ).bind(id, b.warranty_id, sanitize(b.description), b.photo_urls || '').run();
+  return c.json({ ok: true, id }, 201);
+});
+
+app.put('/warranty-claims/:id', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const { id } = c.req.param();
+  const b = await c.req.json();
+  const sets: string[] = [];
+  const vals: any[] = [];
+  if (b.status !== undefined) { sets.push('status = ?'); vals.push(b.status); }
+  if (b.resolution !== undefined) { sets.push('resolution = ?'); vals.push(sanitize(b.resolution)); }
+  if (b.status === 'resolved') { sets.push("resolved_at = datetime('now')"); }
+  vals.push(id);
+  await c.env.DB.prepare(`UPDATE warranty_claims SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run();
+  return c.json({ ok: true });
+});
+
+// ═══ Portfolio Gallery ════════════════════════════════════
+// Public — no auth needed for viewing
+app.get('/portfolio', async (c) => {
+  const cat = c.req.query('category');
+  const featured = c.req.query('featured');
+  let sql = 'SELECT p.*, j.title as job_title, j.service_type FROM portfolio p LEFT JOIN jobs j ON p.job_id = j.id WHERE p.published = 1';
+  const vals: any[] = [];
+  if (cat) { sql += ' AND p.category = ?'; vals.push(cat); }
+  if (featured === '1') { sql += ' AND p.featured = 1'; }
+  sql += ' ORDER BY p.display_order, p.created_at DESC';
+  const rows = await c.env.DB.prepare(sql).bind(...vals).all();
+  return c.json(rows.results);
+});
+
+app.post('/portfolio', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+  const id = uid();
+  await c.env.DB.prepare(
+    'INSERT INTO portfolio (id, job_id, title, description, category, before_photo_url, after_photo_url, additional_photos, featured, display_order, published) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
+  ).bind(id, b.job_id || null, sanitize(b.title), sanitize(b.description || ''), b.category || 'custom_carpentry', b.before_photo_url || '', b.after_photo_url || '', b.additional_photos || '', b.featured ? 1 : 0, b.display_order || 0, b.published ? 1 : 0).run();
+  return c.json({ ok: true, id }, 201);
+});
+
+app.put('/portfolio/:id', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const { id } = c.req.param();
+  const b = await c.req.json();
+  const sets: string[] = [];
+  const vals: any[] = [];
+  for (const k of ['title', 'description', 'category', 'before_photo_url', 'after_photo_url', 'additional_photos']) {
+    if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(k === 'title' || k === 'description' ? sanitize(b[k]) : b[k]); }
+  }
+  for (const k of ['featured', 'published', 'display_order']) {
+    if (b[k] !== undefined) { sets.push(`${k} = ?`); vals.push(typeof b[k] === 'boolean' ? (b[k] ? 1 : 0) : b[k]); }
+  }
+  vals.push(id);
+  await c.env.DB.prepare(`UPDATE portfolio SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run();
+  return c.json({ ok: true });
+});
+
+app.delete('/portfolio/:id', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const { id } = c.req.param();
+  await c.env.DB.prepare('DELETE FROM portfolio WHERE id = ?').bind(id).run();
+  return c.json({ ok: true });
+});
+
+// ═══ QC Checklists ════════════════════════════════════════
+app.get('/qc/:job_id', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const { job_id } = c.req.param();
+  const rows = await c.env.DB.prepare('SELECT * FROM qc_checklists WHERE job_id = ? ORDER BY created_at DESC').bind(job_id).all();
+  return c.json(rows.results);
+});
+
+app.post('/qc', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+  const id = uid();
+  await c.env.DB.prepare(
+    'INSERT INTO qc_checklists (id, job_id, type, items, completed_by, notes) VALUES (?,?,?,?,?,?)'
+  ).bind(id, b.job_id, b.type || 'final_walkthrough', JSON.stringify(b.items || []), sanitize(b.completed_by || 'Adam'), sanitize(b.notes || '')).run();
+  return c.json({ ok: true, id }, 201);
+});
+
+app.put('/qc/:id/sign', async (c) => {
+  // Customer signature (no auth — signed via shared link)
+  const { id } = c.req.param();
+  const b = await c.req.json();
+  await c.env.DB.prepare(
+    "UPDATE qc_checklists SET customer_signed = 1, customer_signature_url = ?, completed_at = datetime('now') WHERE id = ?"
+  ).bind(b.signature_url || '', id).run();
+  return c.json({ ok: true });
+});
+
+// ═══ Enhanced Job Status Workflow ═════════════════════════
+app.put('/jobs/:id/advance', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const { id } = c.req.param();
+  const job = await c.env.DB.prepare('SELECT status FROM jobs WHERE id = ?').bind(id).first() as any;
+  if (!job) return c.json({ error: 'Job not found' }, 404);
+  const workflow: Record<string, string> = {
+    estimate: 'quote_sent',
+    quote_sent: 'approved',
+    approved: 'scheduled',
+    scheduled: 'in_progress',
+    in_progress: 'inspection',
+    inspection: 'final_payment',
+    final_payment: 'completed'
+  };
+  const next = workflow[job.status];
+  if (!next) return c.json({ error: `Cannot advance from status: ${job.status}` }, 400);
+  const sets: string[] = ['status = ?', "updated_at = datetime('now')"];
+  const vals: any[] = [next];
+  if (next === 'in_progress') sets.push("start_date = COALESCE(start_date, date('now'))");
+  if (next === 'completed') sets.push("completion_date = date('now')");
+  vals.push(id);
+  await c.env.DB.prepare(`UPDATE jobs SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run();
+  return c.json({ ok: true, previous: job.status, current: next });
+});
+
+// ═══ Dashboard Enhancement ═══════════════════════════════
+app.get('/dashboard/materials', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const lowStock = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM materials WHERE quantity_on_hand <= reorder_level').first() as any;
+  const totalValue = await c.env.DB.prepare('SELECT SUM(quantity_on_hand * unit_cost) as total FROM materials').first() as any;
+  const categories = await c.env.DB.prepare('SELECT category, COUNT(*) as cnt, SUM(quantity_on_hand * unit_cost) as value FROM materials GROUP BY category').all();
+  return c.json({
+    low_stock_count: lowStock?.cnt || 0,
+    total_inventory_value: totalValue?.total || 0,
+    by_category: categories.results
+  });
+});
+
+app.get('/dashboard/warranties', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const active = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM warranties WHERE status = "active"').first() as any;
+  const expiringSoon = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM warranties WHERE status = 'active' AND end_date <= date('now', '+30 days')").first() as any;
+  const openClaims = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM warranty_claims WHERE status IN ('submitted', 'in_progress')").first() as any;
+  return c.json({
+    active_warranties: active?.cnt || 0,
+    expiring_30_days: expiringSoon?.cnt || 0,
+    open_claims: openClaims?.cnt || 0
+  });
+});
+
 export default app;
