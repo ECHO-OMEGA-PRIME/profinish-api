@@ -106,8 +106,18 @@ app.use('*', async (c, next) => {
 const rateBuckets = new Map<string, { count: number; reset: number }>();
 const RATE_LIMIT = 30; // 30 requests per minute per IP on public POST
 const RATE_WINDOW = 60_000;
+const MAX_BUCKETS = 5000; // prevent unbounded memory growth
+let lastCleanup = Date.now();
+
 function checkRateLimit(ip: string): boolean {
   const now = Date.now();
+  // Prune expired buckets every 5 minutes or when map is too large
+  if (now - lastCleanup > 300_000 || rateBuckets.size > MAX_BUCKETS) {
+    for (const [k, v] of rateBuckets) {
+      if (now > v.reset) rateBuckets.delete(k);
+    }
+    lastCleanup = now;
+  }
   const bucket = rateBuckets.get(ip);
   if (!bucket || now > bucket.reset) {
     rateBuckets.set(ip, { count: 1, reset: now + RATE_WINDOW });
@@ -118,7 +128,7 @@ function checkRateLimit(ip: string): boolean {
 }
 
 // ─── Health ──────────────────────────────────────────────
-app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.3.0', status: 'ok' }));
+app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.4.0', status: 'ok' }));
 app.get('/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }));
 
 // ─── 404 Error Tracking (receives beacons from 404.html) ──
@@ -412,8 +422,70 @@ app.delete('/invoices/:id', async (c) => {
 app.post('/invoices/:id/send', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
-  await c.env.DB.prepare("UPDATE invoices SET status = 'sent', updated_at = datetime('now') WHERE id = ? AND status = 'draft'").bind(c.req.param('id')).run();
-  return c.json({ ok: true });
+  const invId = c.req.param('id');
+  const inv = await c.env.DB.prepare(
+    'SELECT i.*, c.name as customer_name, c.email as customer_email FROM invoices i LEFT JOIN customers c ON i.customer_id = c.id WHERE i.id = ?'
+  ).bind(invId).first() as any;
+  if (!inv) return c.json({ error: 'Invoice not found' }, 404);
+
+  // Update status to sent
+  await c.env.DB.prepare("UPDATE invoices SET status = 'sent', updated_at = datetime('now') WHERE id = ? AND status = 'draft'").bind(invId).run();
+
+  const b = await c.req.json().catch(() => ({})) as any;
+  const method = b.method || 'email'; // 'email' | 'sms' | 'both'
+  const results: any = { status_updated: true };
+
+  // Email via Resend
+  if ((method === 'email' || method === 'both') && c.env.RESEND_API_KEY && inv.customer_email) {
+    try {
+      const viewUrl = `${c.env.SITE_URL || 'https://profinishusa.com'}/api/invoices/public/${inv.share_token}`;
+      const emailResp = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${c.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: 'Pro Finish <invoices@profinishusa.com>',
+          to: [inv.customer_email],
+          subject: `Invoice ${inv.invoice_number} from Pro Finish Custom Carpentry`,
+          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+            <div style="background:#1B4D8E;color:white;padding:20px;text-align:center"><h1 style="margin:0;font-size:24px">PRO FINISH</h1><p style="margin:4px 0 0;opacity:.8">Custom Carpentry</p></div>
+            <div style="padding:30px;background:#fff">
+              <p>Hi ${sanitize(inv.customer_name || 'Customer')},</p>
+              <p>Here is your invoice <strong>${inv.invoice_number}</strong> for <strong>$${(inv.total || 0).toFixed(2)}</strong>.</p>
+              <p>Due date: <strong>${inv.due_date || 'Upon receipt'}</strong></p>
+              <div style="text-align:center;margin:30px 0">
+                <a href="${viewUrl}" style="background:#FFD700;color:#0D2847;padding:14px 32px;text-decoration:none;font-weight:bold;border-radius:8px;display:inline-block">View Invoice</a>
+              </div>
+              <p style="color:#666;font-size:14px">If you have any questions, call Adam at (432) 466-5310.</p>
+            </div>
+            <div style="text-align:center;padding:16px;color:#999;font-size:12px">Pro Finish Custom Carpentry | Big Spring, TX</div>
+          </div>`,
+        }),
+      });
+      results.email = { sent: emailResp.ok, status: emailResp.status };
+    } catch (e: any) {
+      results.email = { sent: false, error: e.message };
+    }
+  }
+
+  // SMS via Twilio
+  if ((method === 'sms' || method === 'both') && c.env.TWILIO_ACCOUNT_SID && inv.customer_phone) {
+    try {
+      const phone = inv.customer_phone.replace(/\D/g, '');
+      const to = phone.startsWith('1') ? '+' + phone : '+1' + phone;
+      const viewUrl = `${c.env.SITE_URL || 'https://profinishusa.com'}/api/invoices/public/${inv.share_token}`;
+      const body = `Pro Finish Invoice ${inv.invoice_number}: $${(inv.total || 0).toFixed(2)} due ${inv.due_date || 'upon receipt'}. View: ${viewUrl}`;
+      const params = new URLSearchParams({ To: to, From: c.env.TWILIO_PHONE_NUMBER || '', Body: body });
+      const smsResp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`, {
+        method: 'POST', body: params,
+        headers: { 'Authorization': 'Basic ' + btoa(c.env.TWILIO_ACCOUNT_SID + ':' + c.env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+      results.sms = { sent: smsResp.ok, status: smsResp.status };
+    } catch (e: any) {
+      results.sms = { sent: false, error: e.message };
+    }
+  }
+
+  return c.json(results);
 });
 
 app.post('/invoices/:id/void', async (c) => {
@@ -716,6 +788,31 @@ app.get('/blog', async (c) => {
   const status = c.req.query('status') || 'published';
   const rows = await c.env.DB.prepare('SELECT * FROM blog_posts WHERE status = ? ORDER BY published_at DESC').bind(status).all();
   return c.json(rows.results);
+});
+
+// Blog RSS Feed (must be above :idOrSlug to prevent slug-matching)
+app.get('/blog/feed.xml', async (c) => {
+  const posts = await c.env.DB.prepare("SELECT title, slug, excerpt, published_at, author FROM blog_posts WHERE status = 'published' ORDER BY published_at DESC LIMIT 20").all();
+  const siteUrl = c.env.SITE_URL || 'https://profinishusa.com';
+  const items = (posts.results as any[]).map((p: any) => `<item>
+    <title><![CDATA[${p.title}]]></title>
+    <link>${siteUrl}/blog/${p.slug}</link>
+    <description><![CDATA[${p.excerpt || ''}]]></description>
+    <pubDate>${p.published_at ? new Date(p.published_at).toUTCString() : ''}</pubDate>
+    <author>${p.author || 'Pro Finish'}</author>
+  </item>`).join('\n');
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+  <title>Pro Finish Custom Carpentry Blog</title>
+  <link>${siteUrl}/blog</link>
+  <description>Expert carpentry tips, project showcases, and home improvement advice from Big Spring, TX</description>
+  <language>en-us</language>
+  <atom:link href="${siteUrl}/api/blog/feed.xml" rel="self" type="application/rss+xml"/>
+  ${items}
+</channel>
+</rss>`;
+  return new Response(xml, { headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' } });
 });
 
 app.get('/blog/:idOrSlug', async (c) => {
@@ -2048,6 +2145,107 @@ app.get('/dashboard/schedule', async (c) => {
   });
 });
 
+
+// ═══ Public Booking (customer self-scheduling) ═══════════
+// Available time slots for next N days
+app.get('/booking/slots', async (c) => {
+  const days = Math.min(Number(c.req.query('days')) || 14, 30);
+  // Get business settings
+  const settingsRows = await c.env.DB.prepare("SELECT key, value FROM settings WHERE key IN ('booking_enabled', 'booking_advance_days', 'booking_slots_per_day', 'business_hours')").all();
+  const cfg: Record<string, string> = {};
+  for (const r of settingsRows.results as any[]) cfg[r.key] = r.value;
+  if (cfg.booking_enabled === '0') return c.json({ error: 'Online booking is currently disabled' }, 503);
+
+  const maxAdvance = Number(cfg.booking_advance_days) || 30;
+  const slotsPerDay = Number(cfg.booking_slots_per_day) || 3;
+  const effectiveDays = Math.min(days, maxAdvance);
+
+  // Get already-booked appointment dates in range
+  const booked = await c.env.DB.prepare(
+    "SELECT date, COUNT(*) as cnt FROM appointments WHERE date >= date('now') AND date <= date('now', '+' || ? || ' days') AND status != 'cancelled' GROUP BY date"
+  ).bind(effectiveDays).all();
+  const bookedMap: Record<string, number> = {};
+  for (const r of booked.results as any[]) bookedMap[r.date] = r.cnt;
+
+  // Generate available slots (skip weekends)
+  const slots: Array<{ date: string; day: string; available: number }> = [];
+  const today = new Date();
+  for (let i = 1; i <= effectiveDays; i++) {
+    const d = new Date(today);
+    d.setDate(d.getDate() + i);
+    const dow = d.getDay();
+    if (dow === 0 || dow === 6) continue; // skip weekends
+    const dateStr = d.toISOString().split('T')[0];
+    const used = bookedMap[dateStr] || 0;
+    const avail = Math.max(0, slotsPerDay - used);
+    if (avail > 0) {
+      slots.push({ date: dateStr, day: d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' }), available: avail });
+    }
+  }
+  return c.json({ slots, service_area: 'Big Spring, Midland, Odessa & the Permian Basin' });
+});
+
+// Public booking request (rate-limited, no auth)
+app.post('/booking/request', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
+  const b = await c.req.json();
+
+  // Validation
+  if (!b.name || typeof b.name !== 'string' || b.name.trim().length < 2) return c.json({ error: 'name required (min 2 chars)' }, 400);
+  if (!b.phone || typeof b.phone !== 'string' || b.phone.replace(/\D/g, '').length < 7) return c.json({ error: 'valid phone required' }, 400);
+  if (!b.date || !/^\d{4}-\d{2}-\d{2}$/.test(b.date)) return c.json({ error: 'date required (YYYY-MM-DD)' }, 400);
+  if (!b.service_type || typeof b.service_type !== 'string') return c.json({ error: 'service_type required' }, 400);
+
+  // Validate date is not in the past
+  const reqDate = new Date(b.date + 'T12:00:00');
+  if (reqDate < new Date()) return c.json({ error: 'Cannot book in the past' }, 400);
+
+  // Check slot availability
+  const existing = await c.env.DB.prepare(
+    "SELECT COUNT(*) as cnt FROM appointments WHERE date = ? AND status != 'cancelled'"
+  ).bind(b.date).first() as any;
+  const slotsPerDay = 3; // default
+  if ((existing?.cnt || 0) >= slotsPerDay) return c.json({ error: 'No availability on this date, please try another day' }, 409);
+
+  // Find or create customer
+  let customerId = null;
+  if (b.email) {
+    const existingCust = await c.env.DB.prepare('SELECT id FROM customers WHERE email = ? OR phone = ?').bind(b.email, b.phone).first() as any;
+    customerId = existingCust?.id;
+  }
+  if (!customerId && b.phone) {
+    const existingCust = await c.env.DB.prepare('SELECT id FROM customers WHERE phone = ?').bind(b.phone).first() as any;
+    customerId = existingCust?.id;
+  }
+  if (!customerId) {
+    customerId = uid();
+    const refCode = 'PF' + customerId.slice(0, 6).toUpperCase();
+    await c.env.DB.prepare(
+      'INSERT INTO customers (id, name, email, phone, referral_code, preferred_language) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(customerId, sanitize(maxLen(b.name, 200)), sanitize(maxLen(b.email || '', 254)), sanitize(maxLen(b.phone, 30)), refCode, 'en').run();
+  }
+
+  // Create appointment
+  const apptId = uid();
+  await c.env.DB.prepare(
+    'INSERT INTO appointments (id, customer_id, title, description, service_type, date, status) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).bind(apptId, customerId, sanitize(maxLen(b.service_type + ' — ' + b.name, 200)), sanitize(maxLen(b.description || '', 1000)), sanitize(maxLen(b.service_type, 100)), b.date, 'pending').run();
+
+  // Notify Adam via SMS if Twilio is configured
+  if (c.env.TWILIO_ACCOUNT_SID && c.env.TWILIO_AUTH_TOKEN && c.env.TWILIO_PHONE_NUMBER) {
+    try {
+      const msg = `New booking request!\n${b.name} - ${b.phone}\nService: ${b.service_type}\nDate: ${b.date}\n${b.description || ''}`;
+      const params = new URLSearchParams({ To: c.env.ADAM_PHONE, From: c.env.TWILIO_PHONE_NUMBER, Body: msg.slice(0, 1600) });
+      await fetch(`https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`, {
+        method: 'POST', body: params,
+        headers: { 'Authorization': 'Basic ' + btoa(c.env.TWILIO_ACCOUNT_SID + ':' + c.env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+    } catch {}
+  }
+
+  return c.json({ ok: true, appointment_id: apptId, customer_id: customerId, message: 'Booking request received! Adam will confirm your appointment shortly.' });
+});
 
 app.onError((err, c) => {
   if (err.message?.includes('JSON')) {
