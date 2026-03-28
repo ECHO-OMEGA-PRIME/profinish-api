@@ -26,3 +26,7 @@ service = "echo-document-delivery"
 # TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
 # ECHO_API_KEY (for shared brain / memory prime)
 # DOC_TENANT_KEY (tenant key for echo-document-delivery)
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "echo_metrics"
