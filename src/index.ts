@@ -118,8 +118,29 @@ function checkRateLimit(ip: string): boolean {
 }
 
 // ─── Health ──────────────────────────────────────────────
-app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.2.0', status: 'ok' }));
+app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.3.0', status: 'ok' }));
 app.get('/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }));
+
+// ─── 404 Error Tracking (receives beacons from 404.html) ──
+app.post('/errors/404', async (c) => {
+  try {
+    const b = await c.req.json();
+    const ip = c.req.header('cf-connecting-ip') || 'unknown';
+    if (!checkRateLimit(ip)) return new Response(null, { status: 204 });
+    await c.env.DB.prepare(
+      'INSERT INTO error_log (id, type, path, referrer, ip, created_at) VALUES (?, ?, ?, ?, ?, datetime("now"))'
+    ).bind(uid(), '404', maxLen(b.path || '', 500), maxLen(b.referrer || '', 500), ip).run();
+  } catch {}
+  return new Response(null, { status: 204 });
+});
+
+// ─── Error log viewer (admin) ──
+app.get('/errors', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const rows = await c.env.DB.prepare('SELECT * FROM error_log ORDER BY created_at DESC LIMIT 100').all();
+  return c.json(rows.results);
+});
 
 // ─── Settings ────────────────────────────────────────────
 // Public settings — only expose safe keys (no API keys, secrets, internal config)
