@@ -189,11 +189,11 @@ function calcDueDate(issueDate: string, terms: string): string {
   return d.toISOString().split('T')[0];
 }
 
-async function genInvoiceNum(db: D1Database): Promise<string> {
+async function genInvoiceNum(db: D1Database, attempt = 0): Promise<string> {
   const now = new Date();
   const prefix = `PF-${String(now.getFullYear()).slice(2)}${String(now.getMonth() + 1).padStart(2, '0')}`;
-  const r = await db.prepare(`SELECT count(*) as c FROM invoices WHERE invoice_number LIKE ?`).bind(prefix + '-%').first<{c:number}>();
-  return `${prefix}-${String((r?.c ?? 0) + 1).padStart(4, '0')}`;
+  const r = await db.prepare(`SELECT MAX(CAST(substr(invoice_number, -4) AS INTEGER)) as max_seq FROM invoices WHERE invoice_number LIKE ?`).bind(prefix + '-%').first<{max_seq: number | null}>();
+  return `${prefix}-${String((r?.max_seq ?? 0) + 1 + attempt).padStart(4, '0')}`;
 }
 
 async function recalcInvoice(db: D1Database, invoiceId: string): Promise<void> {
@@ -249,7 +249,6 @@ app.post('/invoices', async (c) => {
   if (denied) return denied;
   const b = await c.req.json();
   const id = uid();
-  const num = await genInvoiceNum(c.env.DB);
   const shareToken = crypto.randomUUID();
   const issueDate = b.issue_date || new Date().toISOString().split('T')[0];
   const terms = b.payment_terms || 'net_30';
@@ -258,9 +257,20 @@ app.post('/invoices', async (c) => {
   const taxRate = b.tax_rate ?? 0.0825;
   const taxAmt = subtotal * taxRate;
   const total = subtotal + taxAmt;
-  await c.env.DB.prepare(
-    'INSERT INTO invoices (id, job_id, customer_id, invoice_number, status, subtotal, tax_rate, tax_amount, total, due_date, issue_date, payment_terms, sales_rep, notes, share_token, amount_paid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)'
-  ).bind(id, b.job_id || null, b.customer_id, num, 'draft', subtotal, taxRate, taxAmt, total, dueDate, issueDate, terms, b.sales_rep || null, sanitize(b.notes || ''), shareToken).run();
+  let inserted = false;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const num = await genInvoiceNum(c.env.DB, attempt);
+    try {
+      await c.env.DB.prepare(
+        'INSERT INTO invoices (id, job_id, customer_id, invoice_number, status, subtotal, tax_rate, tax_amount, total, due_date, issue_date, payment_terms, sales_rep, notes, share_token, amount_paid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)'
+      ).bind(id, b.job_id || null, b.customer_id, num, 'draft', subtotal, taxRate, taxAmt, total, dueDate, issueDate, terms, b.sales_rep || null, sanitize(b.notes || ''), shareToken).run();
+      inserted = true;
+      break;
+    } catch (e: any) {
+      if (!e.message?.includes('UNIQUE constraint') || attempt === 4) throw e;
+    }
+  }
+  if (!inserted) throw new Error('Failed to generate unique invoice number after 5 attempts');
 
   if (b.items && Array.isArray(b.items)) {
     for (const item of b.items) {
@@ -566,8 +576,9 @@ app.get('/blog', async (c) => {
   return c.json(rows.results);
 });
 
-app.get('/blog/:slug', async (c) => {
-  const row = await c.env.DB.prepare('SELECT * FROM blog_posts WHERE slug = ?').bind(c.req.param('slug')).first();
+app.get('/blog/:idOrSlug', async (c) => {
+  const param = c.req.param('idOrSlug');
+  const row = await c.env.DB.prepare('SELECT * FROM blog_posts WHERE id = ? OR slug = ?').bind(param, param).first();
   return row ? c.json(row) : c.json({ error: 'Not found' }, 404);
 });
 
@@ -577,9 +588,10 @@ app.post('/blog', async (c) => {
   const b = await c.req.json();
   const id = uid();
   const slug = (b.title || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  // Blog content is admin-authored HTML — sanitize title/excerpt/tags but preserve content HTML
   await c.env.DB.prepare(
-    'INSERT INTO blog_posts (id, title, slug, content, excerpt, status, tags, seo_title, seo_description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, sanitize(b.title), slug, sanitize(b.content), sanitize(b.excerpt || ''), b.status || 'draft', sanitize(b.tags || ''), sanitize(b.seo_title || b.title), sanitize(b.seo_description || b.excerpt || '')).run();
+    'INSERT INTO blog_posts (id, title, slug, content, excerpt, status, author, tags, seo_title, seo_description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).bind(id, sanitize(b.title), slug, b.content || '', sanitize(b.excerpt || ''), b.status || 'draft', sanitize(b.author || 'Belle'), sanitize(b.tags || ''), sanitize(b.seo_title || b.title), sanitize(b.seo_description || b.excerpt || '')).run();
   return c.json({ id, slug });
 });
 
