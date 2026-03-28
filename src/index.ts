@@ -2457,13 +2457,23 @@ app.post('/booking/request', async (c) => {
 
   // Notify Adam via SMS if Twilio is configured
   if (c.env.TWILIO_ACCOUNT_SID && c.env.TWILIO_AUTH_TOKEN && c.env.TWILIO_PHONE_NUMBER) {
+    const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`;
+    const twilioHeaders = { 'Authorization': 'Basic ' + btoa(c.env.TWILIO_ACCOUNT_SID + ':' + c.env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' };
+    // SMS to Adam (owner)
     try {
       const msg = `New booking request!\n${b.name} - ${b.phone}\nService: ${b.service_type}\nDate: ${b.date}\n${b.address ? 'Address: ' + b.address + '\n' : ''}${b.description || ''}`;
-      const params = new URLSearchParams({ To: c.env.ADAM_PHONE, From: c.env.TWILIO_PHONE_NUMBER, Body: msg.slice(0, 1600) });
-      await fetch(`https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`, {
-        method: 'POST', body: params,
-        headers: { 'Authorization': 'Basic ' + btoa(c.env.TWILIO_ACCOUNT_SID + ':' + c.env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' },
-      });
+      await fetch(twilioUrl, { method: 'POST', body: new URLSearchParams({ To: c.env.ADAM_PHONE, From: c.env.TWILIO_PHONE_NUMBER, Body: msg.slice(0, 1600) }), headers: twilioHeaders });
+    } catch {}
+    // Confirmation SMS to customer
+    try {
+      const custPhone = b.phone.replace(/\D/g, '');
+      if (custPhone.length >= 10) {
+        const to = custPhone.length === 10 ? '+1' + custPhone : '+' + custPhone;
+        const dateParts = b.date.split('-');
+        const niceDate = new Date(+dateParts[0], +dateParts[1] - 1, +dateParts[2]).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+        const custMsg = `Hi ${b.name.split(' ')[0]}! Your estimate with Pro Finish Custom Carpentry is requested for ${niceDate}. Adam will call or text to confirm. Questions? (432) 466-5310`;
+        await fetch(twilioUrl, { method: 'POST', body: new URLSearchParams({ To: to, From: c.env.TWILIO_PHONE_NUMBER, Body: custMsg }), headers: twilioHeaders });
+      }
     } catch {}
   }
 
