@@ -602,6 +602,34 @@ app.put('/blog/:id/publish', async (c) => {
   return c.json({ ok: true });
 });
 
+app.put('/blog/:id', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const b = await c.req.json();
+  const fields: string[] = [];
+  const vals: any[] = [];
+  if (b.title !== undefined) { fields.push('title = ?'); vals.push(sanitize(b.title)); }
+  if (b.content !== undefined) { fields.push('content = ?'); vals.push(b.content); }
+  if (b.excerpt !== undefined) { fields.push('excerpt = ?'); vals.push(sanitize(b.excerpt)); }
+  if (b.tags !== undefined) { fields.push('tags = ?'); vals.push(sanitize(b.tags)); }
+  if (b.author !== undefined) { fields.push('author = ?'); vals.push(sanitize(b.author)); }
+  if (b.seo_title !== undefined) { fields.push('seo_title = ?'); vals.push(sanitize(b.seo_title)); }
+  if (b.seo_description !== undefined) { fields.push('seo_description = ?'); vals.push(sanitize(b.seo_description)); }
+  if (b.status !== undefined) { fields.push('status = ?'); vals.push(b.status); }
+  if (!fields.length) return c.json({ error: 'No fields to update' }, 400);
+  fields.push("updated_at = datetime('now')");
+  vals.push(c.req.param('id'));
+  await c.env.DB.prepare(`UPDATE blog_posts SET ${fields.join(', ')} WHERE id = ?`).bind(...vals).run();
+  return c.json({ ok: true });
+});
+
+app.delete('/blog/:id', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  await c.env.DB.prepare('DELETE FROM blog_posts WHERE id = ?').bind(c.req.param('id')).run();
+  return c.json({ ok: true });
+});
+
 // ─── Referrals ───────────────────────────────────────────
 app.get('/referrals', async (c) => {
   const denied = requireAuth(c);
@@ -1590,6 +1618,13 @@ app.delete('/portfolio/:id', async (c) => {
 });
 
 // ═══ QC Checklists ════════════════════════════════════════
+app.get('/qc', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const rows = await c.env.DB.prepare('SELECT q.*, j.title as job_title FROM qc_checklists q LEFT JOIN jobs j ON q.job_id = j.id ORDER BY q.created_at DESC LIMIT 100').all();
+  return c.json(rows.results);
+});
+
 app.get('/qc/:job_id', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
