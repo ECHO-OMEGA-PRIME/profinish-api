@@ -127,6 +127,11 @@ function checkRateLimit(ip: string): boolean {
   return bucket.count <= RATE_LIMIT;
 }
 
+// Cache helper for public read endpoints
+function cached(c: any, data: any, maxAge = 300) {
+  return c.json(data, 200, { 'Cache-Control': `public, max-age=${maxAge}, s-maxage=${maxAge}` });
+}
+
 // ─── Health ──────────────────────────────────────────────
 app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.5.0', status: 'ok' }));
 app.get('/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }));
@@ -622,11 +627,11 @@ app.get('/reviews/stats', async (c) => {
     c.env.DB.prepare('SELECT COUNT(*) as count, COALESCE(AVG(rating), 0) as avg_rating FROM reviews WHERE approved = 1').first() as Promise<any>,
     c.env.DB.prepare("SELECT r.rating, r.text, r.created_at, c.name as customer_name FROM reviews r LEFT JOIN customers c ON r.customer_id = c.id WHERE r.approved = 1 ORDER BY r.created_at DESC LIMIT 6").all(),
   ]);
-  return c.json({
+  return cached(c, {
     count: stats?.count || 0,
     avg_rating: Math.round((stats?.avg_rating || 0) * 10) / 10,
     recent: recent.results,
-  });
+  }, 300);
 });
 
 app.post('/reviews', async (c) => {
@@ -890,7 +895,7 @@ app.post('/permits', async (c) => {
 app.get('/blog', async (c) => {
   const status = c.req.query('status') || 'published';
   const rows = await c.env.DB.prepare('SELECT * FROM blog_posts WHERE status = ? ORDER BY published_at DESC').bind(status).all();
-  return c.json(rows.results);
+  return status === 'published' ? cached(c, rows.results, 600) : c.json(rows.results);
 });
 
 // Blog RSS Feed (must be above :idOrSlug to prevent slug-matching)
@@ -921,7 +926,7 @@ app.get('/blog/feed.xml', async (c) => {
 app.get('/blog/:idOrSlug', async (c) => {
   const param = c.req.param('idOrSlug');
   const row = await c.env.DB.prepare('SELECT * FROM blog_posts WHERE id = ? OR slug = ?').bind(param, param).first();
-  return row ? c.json(row) : c.json({ error: 'Not found' }, 404);
+  return row ? cached(c, row, 600) : c.json({ error: 'Not found' }, 404);
 });
 
 // Dynamic sitemap — includes all published blog posts and portfolio items
@@ -1974,7 +1979,7 @@ app.get('/portfolio', async (c) => {
   if (featured === '1') { sql += ' AND p.featured = 1'; }
   sql += ' ORDER BY p.display_order, p.created_at DESC';
   const rows = await c.env.DB.prepare(sql).bind(...vals).all();
-  return c.json(rows.results);
+  return cached(c, rows.results, 600);
 });
 
 app.post('/portfolio', async (c) => {
@@ -2318,7 +2323,7 @@ app.get('/booking/slots', async (c) => {
       slots.push({ date: dateStr, day: d.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' }), available: avail });
     }
   }
-  return c.json({ slots, service_area: 'Big Spring, Midland, Odessa & the Permian Basin' });
+  return cached(c, { slots, service_area: 'Big Spring, Midland, Odessa & the Permian Basin' }, 300);
 });
 
 // Public booking request (rate-limited, no auth)
