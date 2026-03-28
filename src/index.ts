@@ -208,7 +208,7 @@ async function sendEmail(
 }
 
 // ─── Health ──────────────────────────────────────────────
-app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.6.0', status: 'ok' }));
+app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.7.0', status: 'ok' }));
 app.get('/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }));
 
 // ─── 404 Error Tracking (receives beacons from 404.html) ──
@@ -760,7 +760,7 @@ app.get('/reviews', async (c) => {
   if (approved === '1') sql += ' WHERE r.approved = 1';
   sql += ' ORDER BY r.created_at DESC';
   const rows = await c.env.DB.prepare(sql).all();
-  return c.json(rows.results);
+  return approved === '1' ? cached(c, rows.results, 300) : c.json(rows.results);
 });
 
 // Public review stats (no auth — for homepage widget + AggregateRating schema)
@@ -1237,7 +1237,7 @@ app.get('/promotions', async (c) => {
   if (active === '1') sql += ' WHERE active = 1';
   sql += ' ORDER BY created_at DESC';
   const rows = await c.env.DB.prepare(sql).all();
-  return c.json(rows.results);
+  return active === '1' ? cached(c, rows.results, 300) : c.json(rows.results);
 });
 
 app.post('/promotions', async (c) => {
