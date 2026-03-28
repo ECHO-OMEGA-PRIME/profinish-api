@@ -80,10 +80,26 @@ app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.0.0', status:
 app.get('/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }));
 
 // ─── Settings ────────────────────────────────────────────
+// Public settings — only expose safe keys (no API keys, secrets, internal config)
+const PUBLIC_SETTINGS_KEYS = new Set([
+  'company_name', 'company_phone', 'company_email', 'company_address', 'company_city',
+  'company_tagline', 'company_logo', 'company_website',
+  'business_hours', 'promo_text', 'promo_enabled', 'service_area',
+  'booking_enabled', 'booking_advance_days', 'booking_slots_per_day',
+  'tax_rate', 'referral_amount', 'min_project_amount',
+  'accent_color', 'hero_video_url', 'review_prompt'
+]);
+
 app.get('/settings', async (c) => {
   const rows = await c.env.DB.prepare('SELECT key, value FROM settings').all();
   const settings: Record<string, string> = {};
-  for (const r of rows.results as any[]) settings[r.key] = r.value;
+  // If authenticated as owner/dev, return all settings; otherwise only public keys
+  const user = verifyFirebaseAuth(c.req.raw, 'echo-prime-ai');
+  const apiKey = c.req.header('X-Echo-API-Key');
+  const isAdmin = (user && ['adam@profinishusa.com', 'traxtoolandpro@gmail.com', 'bmcii1976@gmail.com'].includes(user.email)) || (apiKey && apiKey === c.env.ECHO_API_KEY);
+  for (const r of rows.results as any[]) {
+    if (isAdmin || PUBLIC_SETTINGS_KEYS.has(r.key)) settings[r.key] = r.value;
+  }
   return c.json(settings);
 });
 
@@ -157,6 +173,13 @@ app.get('/jobs/:id', async (c) => {
 
 app.post('/jobs', async (c) => {
   const b = await c.req.json();
+  // Basic validation — require title and service_type
+  if (!b.title || typeof b.title !== 'string' || b.title.trim().length < 2) {
+    return c.json({ error: 'title is required (min 2 characters)' }, 400);
+  }
+  if (!b.service_type || typeof b.service_type !== 'string') {
+    return c.json({ error: 'service_type is required' }, 400);
+  }
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO jobs (id, customer_id, title, description, service_type, status, estimated_cost_low, estimated_cost_high, address, city, is_outdoor, scheduled_date, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
@@ -896,6 +919,17 @@ app.get('/dashboard/owner', async (c) => {
 
 app.get('/dashboard/user/:uid', async (c) => {
   const fuid = c.req.param('uid');
+  // SECURITY: Verify requesting user owns this UID (prevent IDOR)
+  const user = verifyFirebaseAuth(c.req.raw, 'echo-prime-ai');
+  const apiKey = c.req.header('X-Echo-API-Key');
+  const isApiKey = apiKey && apiKey === c.env.ECHO_API_KEY;
+  if (!isApiKey) {
+    if (!user) return c.json({ error: 'Authentication required' }, 401);
+    const ownerEmails = [c.env.OWNER_EMAIL || 'adam@profinishusa.com', 'traxtoolandpro@gmail.com', 'adam@profinishusa.com', 'bmcii1976@gmail.com'];
+    if (user.uid !== fuid && !ownerEmails.includes(user.email)) {
+      return c.json({ error: 'Forbidden — you can only view your own dashboard' }, 403);
+    }
+  }
   const customer = await c.env.DB.prepare('SELECT * FROM customers WHERE firebase_uid = ?').bind(fuid).first();
   if (!customer) return c.json({ error: 'Customer not found' }, 404);
   const cid = (customer as any).id;
