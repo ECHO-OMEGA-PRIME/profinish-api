@@ -109,8 +109,9 @@ const RATE_WINDOW = 60_000;
 const MAX_BUCKETS = 5000; // prevent unbounded memory growth
 let lastCleanup = Date.now();
 
-function checkRateLimit(ip: string): boolean {
+function checkRateLimit(ip: string, limit = RATE_LIMIT, prefix = ''): boolean {
   const now = Date.now();
+  const key = prefix ? `${prefix}:${ip}` : ip;
   // Prune expired buckets every 5 minutes or when map is too large
   if (now - lastCleanup > 300_000 || rateBuckets.size > MAX_BUCKETS) {
     for (const [k, v] of rateBuckets) {
@@ -118,13 +119,13 @@ function checkRateLimit(ip: string): boolean {
     }
     lastCleanup = now;
   }
-  const bucket = rateBuckets.get(ip);
+  const bucket = rateBuckets.get(key);
   if (!bucket || now > bucket.reset) {
-    rateBuckets.set(ip, { count: 1, reset: now + RATE_WINDOW });
+    rateBuckets.set(key, { count: 1, reset: now + RATE_WINDOW });
     return true;
   }
   bucket.count++;
-  return bucket.count <= RATE_LIMIT;
+  return bucket.count <= limit;
 }
 
 // Cache helper for public read endpoints
@@ -141,7 +142,7 @@ app.post('/errors/404', async (c) => {
   try {
     const b = await c.req.json();
     const ip = c.req.header('cf-connecting-ip') || 'unknown';
-    if (!checkRateLimit(ip)) return new Response(null, { status: 204 });
+    if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
     await c.env.DB.prepare(
       'INSERT INTO error_log (id, type, path, referrer, ip, created_at) VALUES (?, ?, ?, ?, ?, datetime("now"))'
     ).bind(uid(), '404', maxLen(b.path || '', 500), maxLen(b.referrer || '', 500), ip).run();
@@ -154,7 +155,7 @@ app.post('/analytics/pageview', async (c) => {
   try {
     const b = await c.req.json();
     const ip = c.req.header('cf-connecting-ip') || 'unknown';
-    if (!checkRateLimit(ip)) return new Response(null, { status: 204 });
+    if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
     const country = c.req.header('cf-ipcountry') || '';
     const ua = c.req.header('user-agent') || '';
     const device = /mobile|android|iphone/i.test(ua) ? 'mobile' : /tablet|ipad/i.test(ua) ? 'tablet' : 'desktop';
@@ -369,6 +370,8 @@ app.get('/invoices', async (c) => {
 });
 
 app.get('/invoices/public/:token', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip, 10, 'token')) return c.json({ error: 'Too many requests' }, 429);
   const inv = await c.env.DB.prepare('SELECT i.*, c.name as customer_name, c.email as customer_email, c.phone as customer_phone, c.address as customer_address, c.city as customer_city FROM invoices i LEFT JOIN customers c ON i.customer_id = c.id WHERE i.share_token = ?').bind(c.req.param('token')).first();
   if (!inv) return c.json({ error: 'Not found' }, 404);
   const items = await c.env.DB.prepare('SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY rowid').bind((inv as any).id).all();
@@ -701,6 +704,8 @@ app.post('/reviews/request/:jobId', async (c) => {
 
 // Public: get job info for review page (no auth, token-gated)
 app.get('/reviews/by-token/:token', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip, 10, 'token')) return c.json({ error: 'Too many requests' }, 429);
   const token = c.req.param('token');
   if (!token || token.length < 16) return c.json({ error: 'Invalid token' }, 400);
   const job = await c.env.DB.prepare(
@@ -1045,6 +1050,8 @@ app.post('/referrals/track', async (c) => {
 
 // Public referral code lookup (no auth — for booking page)
 app.get('/referrals/lookup/:code', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip, 10, 'token')) return c.json({ error: 'Too many requests' }, 429);
   const code = c.req.param('code');
   const customer = await c.env.DB.prepare('SELECT id, name FROM customers WHERE referral_code = ?').bind(code).first() as any;
   if (!customer) return c.json({ error: 'Invalid referral code' }, 404);
