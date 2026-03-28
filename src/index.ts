@@ -448,6 +448,19 @@ app.get('/reviews', async (c) => {
   return c.json(rows.results);
 });
 
+// Public review stats (no auth — for homepage widget + AggregateRating schema)
+app.get('/reviews/stats', async (c) => {
+  const [stats, recent] = await Promise.all([
+    c.env.DB.prepare('SELECT COUNT(*) as count, COALESCE(AVG(rating), 0) as avg_rating FROM reviews WHERE approved = 1').first() as Promise<any>,
+    c.env.DB.prepare("SELECT r.rating, r.text, r.created_at, c.name as customer_name FROM reviews r LEFT JOIN customers c ON r.customer_id = c.id WHERE r.approved = 1 ORDER BY r.created_at DESC LIMIT 6").all(),
+  ]);
+  return c.json({
+    count: stats?.count || 0,
+    avg_rating: Math.round((stats?.avg_rating || 0) * 10) / 10,
+    recent: recent.results,
+  });
+});
+
 app.post('/reviews', async (c) => {
   const b = await c.req.json();
   // Validate rating range (1-5 stars)
