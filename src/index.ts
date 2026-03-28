@@ -657,6 +657,80 @@ app.put('/reviews/:id/approve', async (c) => {
   return c.json({ ok: true });
 });
 
+// ─── Review request (send SMS to customer after job) ─────
+app.post('/reviews/request/:jobId', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const jobId = c.req.param('jobId');
+  const job = await c.env.DB.prepare('SELECT j.*, c.name as customer_name, c.phone as customer_phone FROM jobs j LEFT JOIN customers c ON j.customer_id = c.id WHERE j.id = ?').bind(jobId).first() as any;
+  if (!job) return c.json({ error: 'Job not found' }, 404);
+  if (!job.customer_phone) return c.json({ error: 'Customer has no phone number' }, 400);
+
+  // Generate review token
+  const token = uid() + uid();
+  await c.env.DB.prepare("UPDATE jobs SET review_token = ?, review_sent_at = datetime('now') WHERE id = ?").bind(token, jobId).run();
+
+  const reviewUrl = `${c.env.SITE_URL || 'https://profinishusa.com'}/review.html?token=${token}`;
+
+  if (c.env.TWILIO_ACCOUNT_SID && c.env.TWILIO_AUTH_TOKEN && c.env.TWILIO_PHONE_NUMBER) {
+    const msg = `Hi ${job.customer_name}! Thank you for choosing Pro Finish Custom Carpentry. We'd love your feedback — it takes 30 seconds:\n${reviewUrl}\n\n- Adam McLemore`;
+    const params = new URLSearchParams({ To: job.customer_phone, From: c.env.TWILIO_PHONE_NUMBER, Body: msg.slice(0, 1600) });
+    const smsResp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`, {
+      method: 'POST', body: params,
+      headers: { 'Authorization': 'Basic ' + btoa(c.env.TWILIO_ACCOUNT_SID + ':' + c.env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    return c.json({ ok: smsResp.ok, review_url: reviewUrl });
+  }
+  return c.json({ ok: true, review_url: reviewUrl, note: 'Twilio not configured — share link manually' });
+});
+
+// Public: get job info for review page (no auth, token-gated)
+app.get('/reviews/by-token/:token', async (c) => {
+  const token = c.req.param('token');
+  if (!token || token.length < 16) return c.json({ error: 'Invalid token' }, 400);
+  const job = await c.env.DB.prepare(
+    'SELECT j.id, j.title, j.description, j.review_token, c.name as customer_name FROM jobs j LEFT JOIN customers c ON j.customer_id = c.id WHERE j.review_token = ?'
+  ).bind(token).first() as any;
+  if (!job) return c.json({ error: 'Invalid or expired review link' }, 404);
+  return c.json({ job_id: job.id, title: job.title, customer_name: job.customer_name });
+});
+
+// Public: submit review via token
+app.post('/reviews/submit', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
+  const b = await c.req.json();
+  if (!b.token || b.token.length < 16) return c.json({ error: 'Invalid token' }, 400);
+  const rating = Number(b.rating);
+  if (!rating || rating < 1 || rating > 5 || !Number.isInteger(rating)) return c.json({ error: 'rating must be 1-5' }, 400);
+  if (!b.text || typeof b.text !== 'string' || b.text.trim().length < 5) return c.json({ error: 'Please write at least a short review' }, 400);
+
+  const job = await c.env.DB.prepare('SELECT id, customer_id FROM jobs WHERE review_token = ?').bind(b.token).first() as any;
+  if (!job) return c.json({ error: 'Invalid or expired review link' }, 404);
+
+  const id = uid();
+  await c.env.DB.prepare(
+    'INSERT INTO reviews (id, customer_id, job_id, rating, text, approved) VALUES (?, ?, ?, ?, ?, ?)'
+  ).bind(id, job.customer_id, job.id, rating, sanitize(maxLen(b.text, 2000)), 0).run();
+
+  // Invalidate the token so it can't be reused
+  await c.env.DB.prepare("UPDATE jobs SET review_token = NULL WHERE id = ?").bind(job.id).run();
+
+  // Notify Adam
+  if (c.env.TWILIO_ACCOUNT_SID && c.env.TWILIO_AUTH_TOKEN && c.env.TWILIO_PHONE_NUMBER) {
+    try {
+      const msg = `New ${rating}-star review received! "${b.text.slice(0, 100)}..." — check owner dashboard to approve.`;
+      const params = new URLSearchParams({ To: c.env.ADAM_PHONE, From: c.env.TWILIO_PHONE_NUMBER, Body: msg });
+      await fetch(`https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`, {
+        method: 'POST', body: params,
+        headers: { 'Authorization': 'Basic ' + btoa(c.env.TWILIO_ACCOUNT_SID + ':' + c.env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+    } catch {}
+  }
+
+  return c.json({ ok: true, message: 'Thank you for your review! It means a lot to us.' });
+});
+
 // ─── Appointments ────────────────────────────────────────
 app.get('/appointments', async (c) => {
   const denied = requireAuth(c);
