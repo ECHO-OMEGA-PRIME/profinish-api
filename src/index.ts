@@ -128,7 +128,7 @@ function checkRateLimit(ip: string): boolean {
 }
 
 // ─── Health ──────────────────────────────────────────────
-app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.4.0', status: 'ok' }));
+app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.5.0', status: 'ok' }));
 app.get('/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }));
 
 // ─── 404 Error Tracking (receives beacons from 404.html) ──
@@ -142,6 +142,35 @@ app.post('/errors/404', async (c) => {
     ).bind(uid(), '404', maxLen(b.path || '', 500), maxLen(b.referrer || '', 500), ip).run();
   } catch {}
   return new Response(null, { status: 204 });
+});
+
+// ─── Pageview analytics beacon ──
+app.post('/analytics/pageview', async (c) => {
+  try {
+    const b = await c.req.json();
+    const ip = c.req.header('cf-connecting-ip') || 'unknown';
+    if (!checkRateLimit(ip)) return new Response(null, { status: 204 });
+    const country = c.req.header('cf-ipcountry') || '';
+    const ua = c.req.header('user-agent') || '';
+    const device = /mobile|android|iphone/i.test(ua) ? 'mobile' : /tablet|ipad/i.test(ua) ? 'tablet' : 'desktop';
+    await c.env.DB.prepare(
+      'INSERT INTO pageviews (id, path, referrer, country, device) VALUES (?, ?, ?, ?, ?)'
+    ).bind(uid(), maxLen(b.path || '/', 500), maxLen(b.referrer || '', 500), country, device).run();
+  } catch {}
+  return new Response(null, { status: 204 });
+});
+
+app.get('/analytics', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const days = Math.min(Number(c.req.query('days')) || 30, 90);
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const total = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM pageviews WHERE ts >= ?').bind(since).first() as any;
+  const byPage = await c.env.DB.prepare('SELECT path, COUNT(*) as views FROM pageviews WHERE ts >= ? GROUP BY path ORDER BY views DESC LIMIT 20').bind(since).all();
+  const byDevice = await c.env.DB.prepare('SELECT device, COUNT(*) as cnt FROM pageviews WHERE ts >= ? GROUP BY device').bind(since).all();
+  const byDay = await c.env.DB.prepare("SELECT date(ts) as day, COUNT(*) as views FROM pageviews WHERE ts >= ? GROUP BY date(ts) ORDER BY day DESC LIMIT 30").bind(since).all();
+  const byCountry = await c.env.DB.prepare('SELECT country, COUNT(*) as cnt FROM pageviews WHERE ts >= ? GROUP BY country ORDER BY cnt DESC LIMIT 10').bind(since).all();
+  return c.json({ days, total_views: total?.cnt || 0, by_page: byPage.results, by_device: byDevice.results, by_day: byDay.results, by_country: byCountry.results });
 });
 
 // ─── Error log viewer (admin) ──
