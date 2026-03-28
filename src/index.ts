@@ -181,6 +181,8 @@ app.get('/jobs/:id', async (c) => {
 });
 
 app.post('/jobs', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
   const b = await c.req.json();
   // Basic validation — require title and service_type
   if (!b.title || typeof b.title !== 'string' || b.title.trim().length < 2) {
@@ -510,7 +512,16 @@ app.put('/appointments/:id', async (c) => {
 
 // ─── Chat Sessions ───────────────────────────────────────
 app.post('/chat/session', async (c) => {
+  // Require auth or valid customer_id to prevent session pollution
+  const user = verifyFirebaseAuth(c.req.raw, 'echo-prime-ai');
+  const apiKey = c.req.header('X-Echo-API-Key');
   const b = await c.req.json();
+  if (!user && !(apiKey && apiKey === c.env.ECHO_API_KEY)) {
+    // Allow unauthenticated only if customer_id is provided (widget creates session for logged-in user)
+    if (!b.customer_id || typeof b.customer_id !== 'string' || b.customer_id.length < 8) {
+      return c.json({ error: 'Authentication or valid customer_id required' }, 401);
+    }
+  }
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO chat_sessions (id, customer_id, messages, emotion_log) VALUES (?, ?, ?, ?)'
@@ -1704,12 +1715,22 @@ app.post('/qc', async (c) => {
 });
 
 app.put('/qc/:id/sign', async (c) => {
-  // Customer signature (no auth — signed via shared link)
+  // Customer signature — validate signature_name required + non-empty signature data
   const { id } = c.req.param();
   const b = await c.req.json();
+  if (!b.signature_url || typeof b.signature_url !== 'string' || b.signature_url.length < 10) {
+    return c.json({ error: 'signature_url is required' }, 400);
+  }
+  if (!b.customer_name || typeof b.customer_name !== 'string' || b.customer_name.trim().length < 2) {
+    return c.json({ error: 'customer_name is required (min 2 characters)' }, 400);
+  }
+  // Verify QC record exists before updating
+  const qc = await c.env.DB.prepare('SELECT id, customer_signed FROM qc_checklists WHERE id = ?').bind(id).first();
+  if (!qc) return c.json({ error: 'QC checklist not found' }, 404);
+  if ((qc as any).customer_signed === 1) return c.json({ error: 'Already signed' }, 409);
   await c.env.DB.prepare(
     "UPDATE qc_checklists SET customer_signed = 1, customer_signature_url = ?, completed_at = datetime('now') WHERE id = ?"
-  ).bind(b.signature_url || '', id).run();
+  ).bind(sanitize(b.signature_url), id).run();
   return c.json({ ok: true });
 });
 
