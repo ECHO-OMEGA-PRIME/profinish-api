@@ -1402,7 +1402,7 @@ app.post('/receipt/scan', async (c) => {
   try {
     const claudeResp = await fetch(CLAUDE_PROXY_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Echo-API-Key': CLAUDE_PROXY_KEY },
+      headers: { 'Content-Type': 'application/json', 'X-Echo-API-Key': c.env.ECHO_API_KEY },
       body: JSON.stringify({
         model: 'claude-haiku-4-5',
         system: 'You are a receipt OCR assistant. Extract data and return ONLY valid JSON.',
@@ -1716,7 +1716,7 @@ PERSONALITY:
 MEMORY: You have INFINITE MEMORY. You remember every conversation with every customer. If given previous context, reference it naturally. Remember names, project details, preferences, and quotes discussed. Make returning customers feel valued and recognized.`;
 
 const CLAUDE_PROXY_URL = 'https://claude-proxy.echo-op.com/v1/messages';
-const CLAUDE_PROXY_KEY = 'echo-omega-prime-forge-x-2026';
+// CLAUDE_PROXY_KEY pulled from env at call site (c.env.ECHO_API_KEY)
 
 app.post('/belle/chat', async (c) => {
   const ip = c.req.header('cf-connecting-ip') || 'unknown';
@@ -1751,7 +1751,7 @@ app.post('/belle/chat', async (c) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Echo-API-Key': CLAUDE_PROXY_KEY,
+        'X-Echo-API-Key': c.env.ECHO_API_KEY,
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5',
@@ -1796,7 +1796,7 @@ app.post('/belle/vision', async (c) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-Echo-API-Key': CLAUDE_PROXY_KEY,
+        'X-Echo-API-Key': c.env.ECHO_API_KEY,
       },
       body: JSON.stringify({
         model: 'claude-haiku-4-5',
