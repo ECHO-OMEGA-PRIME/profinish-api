@@ -2226,16 +2226,22 @@ app.post('/booking/request', async (c) => {
     ).bind(customerId, sanitize(maxLen(b.name, 200)), sanitize(maxLen(b.email || '', 254)), sanitize(maxLen(b.phone, 30)), refCode, 'en').run();
   }
 
+  // Update customer address if provided
+  if (b.address && customerId) {
+    await c.env.DB.prepare("UPDATE customers SET address = ? WHERE id = ? AND (address IS NULL OR address = '')").bind(sanitize(maxLen(b.address, 500)), customerId).run();
+  }
+
   // Create appointment
   const apptId = uid();
+  const desc = [b.description || '', b.address ? 'Address: ' + b.address : ''].filter(Boolean).join('\n');
   await c.env.DB.prepare(
     'INSERT INTO appointments (id, customer_id, title, description, service_type, date, status) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).bind(apptId, customerId, sanitize(maxLen(b.service_type + ' — ' + b.name, 200)), sanitize(maxLen(b.description || '', 1000)), sanitize(maxLen(b.service_type, 100)), b.date, 'pending').run();
+  ).bind(apptId, customerId, sanitize(maxLen(b.service_type + ' — ' + b.name, 200)), sanitize(maxLen(desc, 1000)), sanitize(maxLen(b.service_type, 100)), b.date, 'pending').run();
 
   // Notify Adam via SMS if Twilio is configured
   if (c.env.TWILIO_ACCOUNT_SID && c.env.TWILIO_AUTH_TOKEN && c.env.TWILIO_PHONE_NUMBER) {
     try {
-      const msg = `New booking request!\n${b.name} - ${b.phone}\nService: ${b.service_type}\nDate: ${b.date}\n${b.description || ''}`;
+      const msg = `New booking request!\n${b.name} - ${b.phone}\nService: ${b.service_type}\nDate: ${b.date}\n${b.address ? 'Address: ' + b.address + '\n' : ''}${b.description || ''}`;
       const params = new URLSearchParams({ To: c.env.ADAM_PHONE, From: c.env.TWILIO_PHONE_NUMBER, Body: msg.slice(0, 1600) });
       await fetch(`https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`, {
         method: 'POST', body: params,
