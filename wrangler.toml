@@ -4,10 +4,8 @@ compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-OWNER_EMAIL = "adam@profinishusa.com"
-OWNER_PHONE = "4324665310"
-ADAM_PHONE = "+14324665310"
 SITE_URL = "https://profinishusa.com"
+# OWNER_EMAIL, OWNER_PHONE, ADAM_PHONE → set via wrangler secret put
 
 [[d1_databases]]
 binding = "DB"
