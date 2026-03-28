@@ -619,6 +619,11 @@ app.post('/expenses', async (c) => {
 // ─── Reviews ─────────────────────────────────────────────
 app.get('/reviews', async (c) => {
   const approved = c.req.query('approved');
+  // Non-approved reviews require auth (admin only)
+  if (approved !== '1') {
+    const denied = requireAuth(c);
+    if (denied) return denied;
+  }
   let sql = 'SELECT r.*, c.name as customer_name FROM reviews r LEFT JOIN customers c ON r.customer_id = c.id';
   if (approved === '1') sql += ' WHERE r.approved = 1';
   sql += ' ORDER BY r.created_at DESC';
