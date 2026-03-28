@@ -100,6 +100,8 @@ app.use('*', async (c, next) => {
   c.header('X-Content-Type-Options', 'nosniff');
   c.header('X-Frame-Options', 'DENY');
   c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+  c.header('Permissions-Policy', 'camera=(), microphone=(self), geolocation=()');
+  c.header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' https://www.gstatic.com https://elevenlabs.io https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https: blob:; connect-src 'self' https://profinish-api.bmcii1976.workers.dev https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://api.weather.gov; frame-src https://elevenlabs.io; media-src 'self' blob:");
 });
 
 // Simple rate limiter for public POST endpoints (per IP, in-memory — resets on Worker cold start)
@@ -133,8 +135,80 @@ function cached(c: any, data: any, maxAge = 300) {
   return c.json(data, 200, { 'Cache-Control': `public, max-age=${maxAge}, s-maxage=${maxAge}` });
 }
 
+// ─── Notification Logging ─────────────────────────────────
+type NotifChannel = 'sms' | 'email' | 'call';
+type NotifContext = 'booking_owner' | 'booking_customer' | 'review_request' | 'review_notify' | 'invoice_send' | 'twilio_direct' | 'twilio_call';
+
+async function logNotification(
+  db: D1Database,
+  channel: NotifChannel,
+  context: NotifContext,
+  recipient: string,
+  status: 'success' | 'failed',
+  errorMessage?: string,
+  meta?: Record<string, any>
+): Promise<void> {
+  try {
+    await db.prepare(
+      'INSERT INTO notification_log (id, channel, context, recipient, status, error_message, meta, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime("now"))'
+    ).bind(uid(), channel, context, maxLen(recipient, 254), status, errorMessage || null, meta ? JSON.stringify(meta) : null).run();
+  } catch {}
+}
+
+async function sendSms(
+  env: Env,
+  db: D1Database,
+  to: string,
+  body: string,
+  context: NotifContext
+): Promise<{ ok: boolean; status?: number; error?: string }> {
+  if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN || !env.TWILIO_PHONE_NUMBER) {
+    return { ok: false, error: 'Twilio not configured' };
+  }
+  try {
+    const params = new URLSearchParams({ To: to, From: env.TWILIO_PHONE_NUMBER, Body: body.slice(0, 1600) });
+    const resp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Messages.json`, {
+      method: 'POST', body: params,
+      headers: { 'Authorization': 'Basic ' + btoa(env.TWILIO_ACCOUNT_SID + ':' + env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    const ok = resp.ok;
+    await logNotification(db, 'sms', context, to, ok ? 'success' : 'failed', ok ? undefined : `HTTP ${resp.status}`, { status: resp.status });
+    return { ok, status: resp.status };
+  } catch (e: any) {
+    await logNotification(db, 'sms', context, to, 'failed', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+async function sendEmail(
+  env: Env,
+  db: D1Database,
+  to: string,
+  from: string,
+  subject: string,
+  html: string,
+  context: NotifContext
+): Promise<{ ok: boolean; status?: number; error?: string }> {
+  if (!env.RESEND_API_KEY) {
+    return { ok: false, error: 'Resend not configured' };
+  }
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: [to], subject, html }),
+    });
+    const ok = resp.ok;
+    await logNotification(db, 'email', context, to, ok ? 'success' : 'failed', ok ? undefined : `HTTP ${resp.status}`, { status: resp.status, subject });
+    return { ok, status: resp.status };
+  } catch (e: any) {
+    await logNotification(db, 'email', context, to, 'failed', e.message, { subject });
+    return { ok: false, error: e.message };
+  }
+}
+
 // ─── Health ──────────────────────────────────────────────
-app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.5.0', status: 'ok' }));
+app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.6.0', status: 'ok' }));
 app.get('/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }));
 
 // ─── 404 Error Tracking (receives beacons from 404.html) ──
@@ -190,6 +264,27 @@ app.get('/errors', async (c) => {
   if (denied) return denied;
   const rows = await c.env.DB.prepare('SELECT * FROM error_log ORDER BY created_at DESC LIMIT 100').all();
   return c.json(rows.results);
+});
+
+// ─── Notification Log (admin) ──
+app.get('/notifications', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const channel = c.req.query('channel'); // sms | email | call
+  const status = c.req.query('status'); // success | failed
+  const days = Math.min(Number(c.req.query('days')) || 30, 90);
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  let sql = 'SELECT * FROM notification_log WHERE created_at >= ?';
+  const params: any[] = [since];
+  if (channel) { sql += ' AND channel = ?'; params.push(channel); }
+  if (status) { sql += ' AND status = ?'; params.push(status); }
+  sql += ' ORDER BY created_at DESC LIMIT 200';
+  const rows = await c.env.DB.prepare(sql).bind(...params).all();
+  // Summary stats
+  const stats = await c.env.DB.prepare(
+    `SELECT channel, status, COUNT(*) as cnt FROM notification_log WHERE created_at >= ? GROUP BY channel, status`
+  ).bind(since).all();
+  return c.json({ notifications: rows.results, stats: stats.results, days });
 });
 
 // ─── Settings ────────────────────────────────────────────
@@ -478,53 +573,35 @@ app.post('/invoices/:id/send', async (c) => {
   const results: any = { status_updated: true };
 
   // Email via Resend
-  if ((method === 'email' || method === 'both') && c.env.RESEND_API_KEY && inv.customer_email) {
-    try {
-      const viewUrl = `${c.env.SITE_URL || 'https://profinishusa.com'}/api/invoices/public/${inv.share_token}`;
-      const emailResp = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${c.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from: 'Pro Finish <invoices@profinishusa.com>',
-          to: [inv.customer_email],
-          subject: `Invoice ${inv.invoice_number} from Pro Finish Custom Carpentry`,
-          html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
-            <div style="background:#1B4D8E;color:white;padding:20px;text-align:center"><h1 style="margin:0;font-size:24px">PRO FINISH</h1><p style="margin:4px 0 0;opacity:.8">Custom Carpentry</p></div>
-            <div style="padding:30px;background:#fff">
-              <p>Hi ${sanitize(inv.customer_name || 'Customer')},</p>
-              <p>Here is your invoice <strong>${inv.invoice_number}</strong> for <strong>$${(inv.total || 0).toFixed(2)}</strong>.</p>
-              <p>Due date: <strong>${inv.due_date || 'Upon receipt'}</strong></p>
-              <div style="text-align:center;margin:30px 0">
-                <a href="${viewUrl}" style="background:#FFD700;color:#0D2847;padding:14px 32px;text-decoration:none;font-weight:bold;border-radius:8px;display:inline-block">View Invoice</a>
-              </div>
-              <p style="color:#666;font-size:14px">If you have any questions, call Adam at (432) 466-5310.</p>
-            </div>
-            <div style="text-align:center;padding:16px;color:#999;font-size:12px">Pro Finish Custom Carpentry | Big Spring, TX</div>
-          </div>`,
-        }),
-      });
-      results.email = { sent: emailResp.ok, status: emailResp.status };
-    } catch (e: any) {
-      results.email = { sent: false, error: e.message };
-    }
+  if ((method === 'email' || method === 'both') && inv.customer_email) {
+    const viewUrl = `${c.env.SITE_URL || 'https://profinishusa.com'}/api/invoices/public/${inv.share_token}`;
+    const emailResult = await sendEmail(c.env, c.env.DB, inv.customer_email, 'Pro Finish <invoices@profinishusa.com>',
+      `Invoice ${inv.invoice_number} from Pro Finish Custom Carpentry`,
+      `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+        <div style="background:#1B4D8E;color:white;padding:20px;text-align:center"><h1 style="margin:0;font-size:24px">PRO FINISH</h1><p style="margin:4px 0 0;opacity:.8">Custom Carpentry</p></div>
+        <div style="padding:30px;background:#fff">
+          <p>Hi ${sanitize(inv.customer_name || 'Customer')},</p>
+          <p>Here is your invoice <strong>${inv.invoice_number}</strong> for <strong>$${(inv.total || 0).toFixed(2)}</strong>.</p>
+          <p>Due date: <strong>${inv.due_date || 'Upon receipt'}</strong></p>
+          <div style="text-align:center;margin:30px 0">
+            <a href="${viewUrl}" style="background:#FFD700;color:#0D2847;padding:14px 32px;text-decoration:none;font-weight:bold;border-radius:8px;display:inline-block">View Invoice</a>
+          </div>
+          <p style="color:#666;font-size:14px">If you have any questions, call Adam at (432) 466-5310.</p>
+        </div>
+        <div style="text-align:center;padding:16px;color:#999;font-size:12px">Pro Finish Custom Carpentry | Big Spring, TX</div>
+      </div>`,
+      'invoice_send');
+    results.email = { sent: emailResult.ok, status: emailResult.status };
   }
 
   // SMS via Twilio
-  if ((method === 'sms' || method === 'both') && c.env.TWILIO_ACCOUNT_SID && inv.customer_phone) {
-    try {
-      const phone = inv.customer_phone.replace(/\D/g, '');
-      const to = phone.startsWith('1') ? '+' + phone : '+1' + phone;
-      const viewUrl = `${c.env.SITE_URL || 'https://profinishusa.com'}/api/invoices/public/${inv.share_token}`;
-      const body = `Pro Finish Invoice ${inv.invoice_number}: $${(inv.total || 0).toFixed(2)} due ${inv.due_date || 'upon receipt'}. View: ${viewUrl}`;
-      const params = new URLSearchParams({ To: to, From: c.env.TWILIO_PHONE_NUMBER || '', Body: body });
-      const smsResp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`, {
-        method: 'POST', body: params,
-        headers: { 'Authorization': 'Basic ' + btoa(c.env.TWILIO_ACCOUNT_SID + ':' + c.env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' },
-      });
-      results.sms = { sent: smsResp.ok, status: smsResp.status };
-    } catch (e: any) {
-      results.sms = { sent: false, error: e.message };
-    }
+  if ((method === 'sms' || method === 'both') && inv.customer_phone) {
+    const phone = inv.customer_phone.replace(/\D/g, '');
+    const to = phone.startsWith('1') ? '+' + phone : '+1' + phone;
+    const viewUrl = `${c.env.SITE_URL || 'https://profinishusa.com'}/api/invoices/public/${inv.share_token}`;
+    const smsBody = `Pro Finish Invoice ${inv.invoice_number}: $${(inv.total || 0).toFixed(2)} due ${inv.due_date || 'upon receipt'}. View: ${viewUrl}`;
+    const smsResult = await sendSms(c.env, c.env.DB, to, smsBody, 'invoice_send');
+    results.sms = { sent: smsResult.ok, status: smsResult.status };
   }
 
   return c.json(results);
@@ -690,16 +767,12 @@ app.post('/reviews/request/:jobId', async (c) => {
 
   const reviewUrl = `${c.env.SITE_URL || 'https://profinishusa.com'}/review.html?token=${token}`;
 
-  if (c.env.TWILIO_ACCOUNT_SID && c.env.TWILIO_AUTH_TOKEN && c.env.TWILIO_PHONE_NUMBER) {
-    const msg = `Hi ${job.customer_name}! Thank you for choosing Pro Finish Custom Carpentry. We'd love your feedback — it takes 30 seconds:\n${reviewUrl}\n\n- Adam McLemore`;
-    const params = new URLSearchParams({ To: job.customer_phone, From: c.env.TWILIO_PHONE_NUMBER, Body: msg.slice(0, 1600) });
-    const smsResp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`, {
-      method: 'POST', body: params,
-      headers: { 'Authorization': 'Basic ' + btoa(c.env.TWILIO_ACCOUNT_SID + ':' + c.env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' },
-    });
-    return c.json({ ok: smsResp.ok, review_url: reviewUrl });
+  const msg = `Hi ${job.customer_name}! Thank you for choosing Pro Finish Custom Carpentry. We'd love your feedback — it takes 30 seconds:\n${reviewUrl}\n\n- Adam McLemore`;
+  const smsResult = await sendSms(c.env, c.env.DB, job.customer_phone, msg, 'review_request');
+  if (smsResult.ok) {
+    return c.json({ ok: true, review_url: reviewUrl });
   }
-  return c.json({ ok: true, review_url: reviewUrl, note: 'Twilio not configured — share link manually' });
+  return c.json({ ok: true, review_url: reviewUrl, note: smsResult.error || 'SMS not sent — share link manually' });
 });
 
 // Public: get job info for review page (no auth, token-gated)
@@ -737,16 +810,9 @@ app.post('/reviews/submit', async (c) => {
   await c.env.DB.prepare("UPDATE jobs SET review_token = NULL WHERE id = ?").bind(job.id).run();
 
   // Notify Adam
-  if (c.env.TWILIO_ACCOUNT_SID && c.env.TWILIO_AUTH_TOKEN && c.env.TWILIO_PHONE_NUMBER) {
-    try {
-      const msg = `New ${rating}-star review received! "${b.text.slice(0, 100)}..." — check owner dashboard to approve.`;
-      const params = new URLSearchParams({ To: c.env.ADAM_PHONE, From: c.env.TWILIO_PHONE_NUMBER, Body: msg });
-      await fetch(`https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`, {
-        method: 'POST', body: params,
-        headers: { 'Authorization': 'Basic ' + btoa(c.env.TWILIO_ACCOUNT_SID + ':' + c.env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' },
-      });
-    } catch {}
-  }
+  await sendSms(c.env, c.env.DB, c.env.ADAM_PHONE,
+    `New ${rating}-star review received! "${b.text.slice(0, 100)}..." — check owner dashboard to approve.`,
+    'review_notify');
 
   return c.json({ ok: true, message: 'Thank you for your review! It means a lot to us.' });
 });
@@ -1200,25 +1266,25 @@ app.post('/twilio/call', async (c) => {
   const b = await c.req.json();
   const twiml = `<Response><Say voice="Polly.Joanna">Hey Adam, this is Belle from Pro Finish. ${sanitize(b.reason) || 'You have a new lead.'}. Customer ${sanitize(b.customer_name) || 'unknown'} at ${sanitize(b.customer_phone) || 'unknown number'}. Have a great day!</Say></Response>`;
   const params = new URLSearchParams({ To: c.env.ADAM_PHONE, From: FROM, Twiml: twiml });
-  const resp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${SID}/Calls.json`, {
-    method: 'POST', body: params,
-    headers: { 'Authorization': 'Basic ' + btoa(SID + ':' + TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' }
-  });
-  return c.json({ ok: true, status: resp.status });
+  try {
+    const resp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${SID}/Calls.json`, {
+      method: 'POST', body: params,
+      headers: { 'Authorization': 'Basic ' + btoa(SID + ':' + TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+    await logNotification(c.env.DB, 'call', 'twilio_call', c.env.ADAM_PHONE, resp.ok ? 'success' : 'failed', resp.ok ? undefined : `HTTP ${resp.status}`);
+    return c.json({ ok: true, status: resp.status });
+  } catch (e: any) {
+    await logNotification(c.env.DB, 'call', 'twilio_call', c.env.ADAM_PHONE, 'failed', e.message);
+    return c.json({ ok: false, error: e.message }, 500);
+  }
 });
 
 app.post('/twilio/sms', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
-  const { SID, TOKEN, FROM } = { SID: c.env.TWILIO_ACCOUNT_SID, TOKEN: c.env.TWILIO_AUTH_TOKEN, FROM: c.env.TWILIO_PHONE_NUMBER };
-  if (!SID || !TOKEN || !FROM) return c.json({ error: 'Twilio not configured' }, 503);
   const b = await c.req.json();
-  const params = new URLSearchParams({ To: b.to, From: FROM, Body: b.body });
-  const resp = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${SID}/Messages.json`, {
-    method: 'POST', body: params,
-    headers: { 'Authorization': 'Basic ' + btoa(SID + ':' + TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' }
-  });
-  return c.json({ ok: true, status: resp.status });
+  const result = await sendSms(c.env, c.env.DB, b.to, b.body, 'twilio_direct');
+  return c.json({ ok: result.ok, status: result.status });
 });
 
 // ─── Weather ─────────────────────────────────────────────
@@ -2455,68 +2521,55 @@ app.post('/booking/request', async (c) => {
     'INSERT INTO appointments (id, customer_id, title, description, service_type, date, status) VALUES (?, ?, ?, ?, ?, ?, ?)'
   ).bind(apptId, customerId, sanitize(maxLen(b.service_type + ' — ' + b.name, 200)), sanitize(maxLen(desc, 1000)), sanitize(maxLen(b.service_type, 100)), b.date, 'pending').run();
 
-  // Notify Adam via SMS if Twilio is configured
-  if (c.env.TWILIO_ACCOUNT_SID && c.env.TWILIO_AUTH_TOKEN && c.env.TWILIO_PHONE_NUMBER) {
-    const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${c.env.TWILIO_ACCOUNT_SID}/Messages.json`;
-    const twilioHeaders = { 'Authorization': 'Basic ' + btoa(c.env.TWILIO_ACCOUNT_SID + ':' + c.env.TWILIO_AUTH_TOKEN), 'Content-Type': 'application/x-www-form-urlencoded' };
-    // SMS to Adam (owner)
-    try {
-      const msg = `New booking request!\n${b.name} - ${b.phone}\nService: ${b.service_type}\nDate: ${b.date}\n${b.address ? 'Address: ' + b.address + '\n' : ''}${b.description || ''}`;
-      await fetch(twilioUrl, { method: 'POST', body: new URLSearchParams({ To: c.env.ADAM_PHONE, From: c.env.TWILIO_PHONE_NUMBER, Body: msg.slice(0, 1600) }), headers: twilioHeaders });
-    } catch {}
-    // Confirmation SMS to customer
-    try {
-      const custPhone = b.phone.replace(/\D/g, '');
-      if (custPhone.length >= 10) {
-        const to = custPhone.length === 10 ? '+1' + custPhone : '+' + custPhone;
-        const dateParts = b.date.split('-');
-        const niceDate = new Date(+dateParts[0], +dateParts[1] - 1, +dateParts[2]).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-        const custMsg = `Hi ${b.name.split(' ')[0]}! Your estimate with Pro Finish Custom Carpentry is requested for ${niceDate}. Adam will call or text to confirm. Questions? (432) 466-5310`;
-        await fetch(twilioUrl, { method: 'POST', body: new URLSearchParams({ To: to, From: c.env.TWILIO_PHONE_NUMBER, Body: custMsg }), headers: twilioHeaders });
-      }
-    } catch {}
+  // Notify Adam via SMS
+  await sendSms(c.env, c.env.DB, c.env.ADAM_PHONE,
+    `New booking request!\n${b.name} - ${b.phone}\nService: ${b.service_type}\nDate: ${b.date}\n${b.address ? 'Address: ' + b.address + '\n' : ''}${b.description || ''}`,
+    'booking_owner');
+
+  // Confirmation SMS to customer
+  const custPhone = b.phone.replace(/\D/g, '');
+  if (custPhone.length >= 10) {
+    const to = custPhone.length === 10 ? '+1' + custPhone : '+' + custPhone;
+    const dateParts = b.date.split('-');
+    const niceDate = new Date(+dateParts[0], +dateParts[1] - 1, +dateParts[2]).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+    await sendSms(c.env, c.env.DB, to,
+      `Hi ${b.name.split(' ')[0]}! Your estimate with Pro Finish Custom Carpentry is requested for ${niceDate}. Adam will call or text to confirm. Questions? (432) 466-5310`,
+      'booking_customer');
   }
 
-  // Email confirmation to customer if Resend configured and email provided
-  if (c.env.RESEND_API_KEY && b.email) {
-    try {
-      const dateParts = b.date.split('-');
-      const niceDate = new Date(+dateParts[0], +dateParts[1] - 1, +dateParts[2]).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
-      const serviceLabels: Record<string, string> = { trim_work: 'Trim Work', crown_molding: 'Crown Molding', baseboards: 'Baseboards', wainscoting: 'Wainscoting', custom_cabinetry: 'Custom Cabinetry', built_in_shelving: 'Built-in Shelving', fireplace_mantels: 'Fireplace Mantels', coffered_ceilings: 'Coffered Ceilings', door_window_casings: 'Door/Window Casings', closet_systems: 'Closet Systems', other: 'Other' };
-      const svcLabel = serviceLabels[b.service_type] || b.service_type;
-      const firstName = (b.name || '').split(' ')[0];
-      await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${c.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from: 'Pro Finish Custom Carpentry <bookings@profinishusa.com>',
-          to: [b.email],
-          subject: `Estimate Requested — ${niceDate}`,
-          html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:20px">
-            <div style="background:#0D2847;color:#fff;padding:20px;text-align:center;border-radius:8px 8px 0 0">
-              <h1 style="margin:0;font-size:1.3rem">Pro Finish Custom Carpentry</h1>
-            </div>
-            <div style="background:#fff;padding:24px;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 8px 8px">
-              <p style="font-size:1rem;color:#1e293b">Hi ${firstName},</p>
-              <p style="color:#475569">Thank you for requesting an estimate! Here are your details:</p>
-              <table style="width:100%;border-collapse:collapse;margin:16px 0">
-                <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Service</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${svcLabel}</td></tr>
-                <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Date</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${niceDate}</td></tr>
-                ${b.address ? `<tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Address</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${sanitize(b.address)}</td></tr>` : ''}
-                <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Confirmation #</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${apptId}</td></tr>
-              </table>
-              <p style="color:#475569"><strong>What happens next:</strong> Adam will call or text you to confirm the appointment time. If you need to reschedule, just call <a href="tel:4324665310" style="color:#1B4D8E">(432) 466-5310</a>.</p>
-              <div style="text-align:center;margin-top:20px;padding-top:16px;border-top:1px solid #e2e8f0">
-                <p style="font-size:.85rem;color:#94a3b8">Pro Finish Custom Carpentry &bull; Big Spring, TX &bull; (432) 466-5310</p>
-              </div>
-            </div>
-          </div>`
-        })
-      });
-    } catch {}
+  // Email confirmation to customer
+  if (b.email) {
+    const dateParts = b.date.split('-');
+    const niceDate = new Date(+dateParts[0], +dateParts[1] - 1, +dateParts[2]).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    const serviceLabels: Record<string, string> = { trim_work: 'Trim Work', crown_molding: 'Crown Molding', baseboards: 'Baseboards', wainscoting: 'Wainscoting', custom_cabinetry: 'Custom Cabinetry', built_in_shelving: 'Built-in Shelving', fireplace_mantels: 'Fireplace Mantels', coffered_ceilings: 'Coffered Ceilings', door_window_casings: 'Door/Window Casings', closet_systems: 'Closet Systems', other: 'Other' };
+    const svcLabel = serviceLabels[b.service_type] || b.service_type;
+    const firstName = (b.name || '').split(' ')[0];
+    await sendEmail(c.env, c.env.DB, b.email, 'Pro Finish Custom Carpentry <bookings@profinishusa.com>',
+      `Estimate Requested — ${niceDate}`,
+      `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:20px">
+        <div style="background:#0D2847;color:#fff;padding:20px;text-align:center;border-radius:8px 8px 0 0">
+          <h1 style="margin:0;font-size:1.3rem">Pro Finish Custom Carpentry</h1>
+        </div>
+        <div style="background:#fff;padding:24px;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 8px 8px">
+          <p style="font-size:1rem;color:#1e293b">Hi ${firstName},</p>
+          <p style="color:#475569">Thank you for requesting an estimate! Here are your details:</p>
+          <table style="width:100%;border-collapse:collapse;margin:16px 0">
+            <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Service</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${svcLabel}</td></tr>
+            <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Date</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${niceDate}</td></tr>
+            ${b.address ? `<tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Address</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${sanitize(b.address)}</td></tr>` : ''}
+            <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Confirmation #</td><td style="padding:8px 12px;border:1px solid #e2e8f0;font-weight:700">PF-${apptId.slice(0, 6).toUpperCase()}</td></tr>
+          </table>
+          <p style="color:#475569"><strong>What happens next:</strong> Adam will call or text you to confirm the appointment time. If you need to reschedule, just call <a href="tel:4324665310" style="color:#1B4D8E">(432) 466-5310</a>.</p>
+          <div style="text-align:center;margin-top:20px;padding-top:16px;border-top:1px solid #e2e8f0">
+            <p style="font-size:.85rem;color:#94a3b8">Pro Finish Custom Carpentry &bull; Big Spring, TX &bull; (432) 466-5310</p>
+          </div>
+        </div>
+      </div>`,
+      'booking_customer');
   }
 
-  return c.json({ ok: true, appointment_id: apptId, customer_id: customerId, message: 'Booking request received! Adam will confirm your appointment shortly.' });
+  const confirmationNumber = 'PF-' + apptId.slice(0, 6).toUpperCase();
+  return c.json({ ok: true, appointment_id: apptId, confirmation_number: confirmationNumber, customer_id: customerId, message: 'Booking request received! Adam will confirm your appointment shortly.' });
 });
 
 app.onError((err, c) => {
