@@ -1788,4 +1788,51 @@ app.get('/dashboard/warranties', async (c) => {
   });
 });
 
+// ═══ Business Overview Stats ═════════════════════════════
+app.get('/dashboard/overview', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const [customers, jobs, activeJobs, revenue, appointments, reviews, pendingInvoices, expenses] = await Promise.all([
+    c.env.DB.prepare('SELECT COUNT(*) as cnt FROM customers').first() as Promise<any>,
+    c.env.DB.prepare('SELECT COUNT(*) as cnt FROM jobs').first() as Promise<any>,
+    c.env.DB.prepare("SELECT COUNT(*) as cnt FROM jobs WHERE status IN ('in_progress','scheduled','approved')").first() as Promise<any>,
+    c.env.DB.prepare("SELECT COALESCE(SUM(amount),0) as total FROM payments WHERE status = 'completed'").first() as Promise<any>,
+    c.env.DB.prepare("SELECT COUNT(*) as cnt FROM appointments WHERE date >= date('now') AND status = 'scheduled'").first() as Promise<any>,
+    c.env.DB.prepare('SELECT COUNT(*) as cnt, COALESCE(AVG(rating),0) as avg FROM reviews WHERE approved = 1').first() as Promise<any>,
+    c.env.DB.prepare("SELECT COUNT(*) as cnt, COALESCE(SUM(total),0) as total FROM invoices WHERE status IN ('sent','viewed','partial')").first() as Promise<any>,
+    c.env.DB.prepare("SELECT COALESCE(SUM(amount),0) as total FROM expenses WHERE date >= date('now','start of month')").first() as Promise<any>,
+  ]);
+  return c.json({
+    total_customers: customers?.cnt || 0,
+    total_jobs: jobs?.cnt || 0,
+    active_jobs: activeJobs?.cnt || 0,
+    total_revenue: revenue?.total || 0,
+    upcoming_appointments: appointments?.cnt || 0,
+    review_count: reviews?.cnt || 0,
+    avg_rating: Math.round((reviews?.avg || 0) * 10) / 10,
+    outstanding_invoices: { count: pendingInvoices?.cnt || 0, total: pendingInvoices?.total || 0 },
+    monthly_expenses: expenses?.total || 0,
+  });
+});
+
+// ═══ Recent Activity Feed ════════════════════════════════
+app.get('/dashboard/activity', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const limit = Math.min(Number(c.req.query('limit')) || 20, 50);
+  // Union recent events from multiple tables
+  const sql = `
+    SELECT 'job' as type, id, title as label, status, created_at FROM jobs
+    UNION ALL
+    SELECT 'appointment' as type, id, title as label, status, created_at FROM appointments
+    UNION ALL
+    SELECT 'payment' as type, id, 'Payment $' || amount as label, status, created_at FROM payments
+    UNION ALL
+    SELECT 'review' as type, id, 'Review by ' || customer_name as label, CAST(rating as TEXT), created_at FROM reviews
+    ORDER BY created_at DESC LIMIT ?
+  `;
+  const rows = await c.env.DB.prepare(sql).bind(limit).all();
+  return c.json(rows.results);
+});
+
 export default app;
