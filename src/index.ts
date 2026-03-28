@@ -93,8 +93,32 @@ const maxLen = (s: any, max: number): string => {
   return str.length > max ? str.slice(0, max) : str;
 };
 
+// Security headers — HSTS, content type options, frame options
+app.use('*', async (c, next) => {
+  await next();
+  c.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('X-Frame-Options', 'DENY');
+  c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+});
+
+// Simple rate limiter for public POST endpoints (per IP, in-memory — resets on Worker cold start)
+const rateBuckets = new Map<string, { count: number; reset: number }>();
+const RATE_LIMIT = 30; // 30 requests per minute per IP on public POST
+const RATE_WINDOW = 60_000;
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const bucket = rateBuckets.get(ip);
+  if (!bucket || now > bucket.reset) {
+    rateBuckets.set(ip, { count: 1, reset: now + RATE_WINDOW });
+    return true;
+  }
+  bucket.count++;
+  return bucket.count <= RATE_LIMIT;
+}
+
 // ─── Health ──────────────────────────────────────────────
-app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.1.0', status: 'ok' }));
+app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.2.0', status: 'ok' }));
 app.get('/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }));
 
 // ─── Settings ────────────────────────────────────────────
@@ -146,6 +170,8 @@ app.get('/customers/:id', async (c) => {
 });
 
 app.post('/customers', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
   const body = await c.req.json();
   // Validate required fields
   if (!body.name || typeof body.name !== 'string' || body.name.trim().length < 2) {
@@ -417,6 +443,8 @@ app.post('/payments', async (c) => {
   if (denied) return denied;
   const b = await c.req.json();
   if (!b.invoice_id || !b.amount) return c.json({ error: 'invoice_id and amount required' }, 400);
+  const amt = Number(b.amount);
+  if (isNaN(amt) || amt <= 0 || amt > 999999) return c.json({ error: 'amount must be between 0.01 and 999999' }, 400);
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO payments (id, invoice_id, amount, payment_method, payment_date, reference_number, collected_by, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
@@ -480,6 +508,8 @@ app.get('/reviews/stats', async (c) => {
 });
 
 app.post('/reviews', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
   const b = await c.req.json();
   // Validate rating range (1-5 stars)
   const rating = Number(b.rating);
@@ -490,9 +520,11 @@ app.post('/reviews', async (c) => {
     return c.json({ error: 'review text is required (min 5 characters)' }, 400);
   }
   const id = uid();
+  const photoUrl = b.photo_url ? maxLen(b.photo_url, 500) : null;
+  if (photoUrl && !/^https?:\/\/.+/i.test(photoUrl)) return c.json({ error: 'photo_url must be a valid URL' }, 400);
   await c.env.DB.prepare(
     'INSERT INTO reviews (id, customer_id, job_id, rating, text, photo_url, approved) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, b.customer_id || null, b.job_id || null, rating, sanitize(maxLen(b.text, 2000)), b.photo_url ? maxLen(b.photo_url, 500) : null, 0).run();
+  ).bind(id, b.customer_id || null, b.job_id || null, rating, sanitize(maxLen(b.text, 2000)), photoUrl, 0).run();
   return c.json({ id });
 });
 
@@ -543,6 +575,8 @@ app.put('/appointments/:id', async (c) => {
 
 // ─── Chat Sessions ───────────────────────────────────────
 app.post('/chat/session', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
   // Require auth or valid customer_id to prevent session pollution
   const user = verifyFirebaseAuth(c.req.raw, 'echo-prime-ai');
   const apiKey = c.req.header('X-Echo-API-Key');
@@ -785,6 +819,8 @@ app.post('/promotions', async (c) => {
 
 // ─── NPS ─────────────────────────────────────────────────
 app.post('/nps', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
   const b = await c.req.json();
   // Validate NPS score range (0-10)
   const score = Number(b.score);
@@ -1212,6 +1248,8 @@ const CLAUDE_PROXY_URL = 'https://claude-proxy.echo-op.com/v1/messages';
 const CLAUDE_PROXY_KEY = 'echo-omega-prime-forge-x-2026';
 
 app.post('/belle/chat', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
   const body = await c.req.json();
 
   // Build system prompt + optional brain context
@@ -1643,6 +1681,8 @@ app.get('/warranty-claims', async (c) => {
 });
 
 app.post('/warranty-claims', async (c) => {
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
   const b = await c.req.json();
   const id = uid();
   // Verify warranty is active
