@@ -704,10 +704,10 @@ app.get('/reviews/by-token/:token', async (c) => {
   const token = c.req.param('token');
   if (!token || token.length < 16) return c.json({ error: 'Invalid token' }, 400);
   const job = await c.env.DB.prepare(
-    'SELECT j.id, j.title, j.description, j.review_token, c.name as customer_name FROM jobs j LEFT JOIN customers c ON j.customer_id = c.id WHERE j.review_token = ?'
+    'SELECT j.id, j.title, j.description, j.review_token, c.name as customer_name, c.referral_code FROM jobs j LEFT JOIN customers c ON j.customer_id = c.id WHERE j.review_token = ?'
   ).bind(token).first() as any;
   if (!job) return c.json({ error: 'Invalid or expired review link' }, 404);
-  return c.json({ job_id: job.id, title: job.title, customer_name: job.customer_name });
+  return c.json({ job_id: job.id, title: job.title, customer_name: job.customer_name, referral_code: job.referral_code || null });
 });
 
 // Public: submit review via token
@@ -1041,6 +1041,26 @@ app.post('/referrals/track', async (c) => {
     'INSERT INTO referrals (id, referrer_id, referred_id) VALUES (?, ?, ?)'
   ).bind(id, referrer.id, b.referred_id).run();
   return c.json({ id, referrer_id: referrer.id });
+});
+
+// Public referral code lookup (no auth — for booking page)
+app.get('/referrals/lookup/:code', async (c) => {
+  const code = c.req.param('code');
+  const customer = await c.env.DB.prepare('SELECT id, name FROM customers WHERE referral_code = ?').bind(code).first() as any;
+  if (!customer) return c.json({ error: 'Invalid referral code' }, 404);
+  return c.json({ valid: true, referrer_name: customer.name?.split(' ')[0] || 'A friend' });
+});
+
+// Referral stats for owner dashboard
+app.get('/referrals/stats', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const total = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM referrals').first() as any;
+  const converted = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM referrals WHERE status = 'converted'").first() as any;
+  const topReferrers = await c.env.DB.prepare(
+    'SELECT c.name, COUNT(r.id) as referral_count FROM referrals r JOIN customers c ON r.referrer_id = c.id GROUP BY r.referrer_id ORDER BY referral_count DESC LIMIT 5'
+  ).all();
+  return c.json({ total: total?.cnt || 0, converted: converted?.cnt || 0, top_referrers: topReferrers.results });
 });
 
 // ─── Follow-Ups ──────────────────────────────────────────
@@ -2408,6 +2428,17 @@ app.post('/booking/request', async (c) => {
   // Update customer address if provided
   if (b.address && customerId) {
     await c.env.DB.prepare("UPDATE customers SET address = ? WHERE id = ? AND (address IS NULL OR address = '')").bind(sanitize(maxLen(b.address, 500)), customerId).run();
+  }
+
+  // Track referral if referral_code provided
+  if (b.referral_code && typeof b.referral_code === 'string') {
+    try {
+      const referrer = await c.env.DB.prepare('SELECT id FROM customers WHERE referral_code = ?').bind(b.referral_code.trim()).first() as any;
+      if (referrer && referrer.id !== customerId) {
+        await c.env.DB.prepare('INSERT INTO referrals (id, referrer_id, referred_id, status) VALUES (?, ?, ?, ?)').bind(uid(), referrer.id, customerId, 'pending').run();
+        await c.env.DB.prepare("UPDATE customers SET referred_by = ? WHERE id = ? AND (referred_by IS NULL OR referred_by = '')").bind(referrer.id, customerId).run();
+      }
+    } catch {}
   }
 
   // Create appointment
