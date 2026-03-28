@@ -1835,4 +1835,123 @@ app.get('/dashboard/activity', async (c) => {
   return c.json(rows.results);
 });
 
+// ═══ Revenue Analytics ══════════════════════════════════
+app.get('/dashboard/revenue', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const months = Math.min(Number(c.req.query('months')) || 12, 24);
+
+  // Monthly revenue for last N months
+  const monthly = await c.env.DB.prepare(`
+    SELECT strftime('%Y-%m', created_at) as month,
+           COALESCE(SUM(amount), 0) as revenue,
+           COUNT(*) as payment_count
+    FROM payments WHERE status = 'completed'
+      AND created_at >= date('now', '-' || ? || ' months')
+    GROUP BY month ORDER BY month
+  `).bind(months).all();
+
+  // This month vs last month
+  const [thisMonth, lastMonth] = await Promise.all([
+    c.env.DB.prepare("SELECT COALESCE(SUM(amount),0) as total FROM payments WHERE status='completed' AND created_at >= date('now','start of month')").first() as Promise<any>,
+    c.env.DB.prepare("SELECT COALESCE(SUM(amount),0) as total FROM payments WHERE status='completed' AND created_at >= date('now','start of month','-1 month') AND created_at < date('now','start of month')").first() as Promise<any>,
+  ]);
+
+  // Top services by revenue (from jobs)
+  const topServices = await c.env.DB.prepare(`
+    SELECT j.category, COUNT(*) as job_count,
+           COALESCE(SUM(p.amount), 0) as revenue
+    FROM jobs j LEFT JOIN payments p ON p.job_id = j.id AND p.status = 'completed'
+    WHERE j.category IS NOT NULL
+    GROUP BY j.category ORDER BY revenue DESC LIMIT 8
+  `).all();
+
+  return c.json({
+    monthly: monthly.results,
+    this_month: thisMonth?.total || 0,
+    last_month: lastMonth?.total || 0,
+    growth_pct: lastMonth?.total > 0 ? Math.round(((thisMonth?.total - lastMonth?.total) / lastMonth?.total) * 100) : null,
+    top_services: topServices.results,
+  });
+});
+
+// ═══ Customer Search ════════════════════════════════════
+app.get('/customers/search', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const q = (c.req.query('q') || '').trim();
+  if (q.length < 2) return c.json({ error: 'Search query must be at least 2 characters' }, 400);
+  const pattern = `%${q}%`;
+  const rows = await c.env.DB.prepare(
+    `SELECT id, name, email, phone, city, created_at FROM customers
+     WHERE name LIKE ? OR email LIKE ? OR phone LIKE ? OR address LIKE ?
+     ORDER BY name LIMIT 25`
+  ).bind(pattern, pattern, pattern, pattern).all();
+  return c.json(rows.results);
+});
+
+// ═══ Job Pipeline Stats ═════════════════════════════════
+app.get('/dashboard/pipeline', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+
+  const [pipeline, avgDuration, recentCompleted] = await Promise.all([
+    // Jobs grouped by status
+    c.env.DB.prepare(`
+      SELECT status, COUNT(*) as count,
+             COALESCE(SUM(estimated_cost), 0) as total_value
+      FROM jobs GROUP BY status
+    `).all(),
+    // Average job duration (completed jobs only)
+    c.env.DB.prepare(`
+      SELECT AVG(julianday(updated_at) - julianday(created_at)) as avg_days
+      FROM jobs WHERE status = 'completed'
+    `).first() as Promise<any>,
+    // Last 5 completed jobs
+    c.env.DB.prepare(`
+      SELECT id, title, category, estimated_cost, created_at, updated_at
+      FROM jobs WHERE status = 'completed'
+      ORDER BY updated_at DESC LIMIT 5
+    `).all(),
+  ]);
+
+  return c.json({
+    pipeline: pipeline.results,
+    avg_completion_days: avgDuration?.avg_days ? Math.round(avgDuration.avg_days) : null,
+    recent_completed: recentCompleted.results,
+  });
+});
+
+// ═══ Upcoming Schedule ══════════════════════════════════
+app.get('/dashboard/schedule', async (c) => {
+  const denied = requireAuth(c);
+  if (denied) return denied;
+  const days = Math.min(Number(c.req.query('days')) || 14, 60);
+
+  const [appointments, scheduledJobs] = await Promise.all([
+    c.env.DB.prepare(`
+      SELECT id, title, date, time, customer_name, status, notes
+      FROM appointments
+      WHERE date >= date('now') AND date <= date('now', '+' || ? || ' days')
+        AND status = 'scheduled'
+      ORDER BY date, time LIMIT 50
+    `).bind(days).all(),
+    c.env.DB.prepare(`
+      SELECT id, title, category, customer_id, status, start_date, estimated_cost
+      FROM jobs
+      WHERE status IN ('scheduled', 'approved')
+        AND start_date IS NOT NULL
+        AND start_date >= date('now')
+        AND start_date <= date('now', '+' || ? || ' days')
+      ORDER BY start_date LIMIT 50
+    `).bind(days).all(),
+  ]);
+
+  return c.json({
+    appointments: appointments.results,
+    scheduled_jobs: scheduledJobs.results,
+    total_upcoming: (appointments.results?.length || 0) + (scheduledJobs.results?.length || 0),
+  });
+});
+
 export default app;
