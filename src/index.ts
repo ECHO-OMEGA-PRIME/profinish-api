@@ -75,8 +75,26 @@ app.use('*', cors({
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
 }));
 
+// Request body size limit (256KB) — reject oversized payloads before parsing
+const MAX_BODY_SIZE = 256 * 1024;
+app.use('*', async (c, next) => {
+  if (['POST', 'PUT', 'PATCH'].includes(c.req.method)) {
+    const cl = c.req.header('content-length');
+    if (cl && parseInt(cl) > MAX_BODY_SIZE) {
+      return c.json({ error: 'Request body too large (max 256KB)' }, 413);
+    }
+  }
+  await next();
+});
+
+// Input length helper — truncate oversized strings
+const maxLen = (s: any, max: number): string => {
+  const str = typeof s === 'string' ? s : String(s ?? '');
+  return str.length > max ? str.slice(0, max) : str;
+};
+
 // ─── Health ──────────────────────────────────────────────
-app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.0.0', status: 'ok' }));
+app.get('/', (c) => c.json({ service: 'profinish-api', version: '1.1.0', status: 'ok' }));
 app.get('/health', (c) => c.json({ status: 'healthy', timestamp: new Date().toISOString() }));
 
 // ─── Settings ────────────────────────────────────────────
@@ -140,8 +158,8 @@ app.post('/customers', async (c) => {
   const refCode = 'PF' + id.slice(0, 6).toUpperCase();
   await c.env.DB.prepare(
     'INSERT INTO customers (id, firebase_uid, name, email, phone, address, city, is_owner, referral_code, referred_by, preferred_language, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, body.firebase_uid || null, sanitize(body.name), sanitize(body.email || ''), sanitize(body.phone || ''), sanitize(body.address || ''), sanitize(body.city || ''),
-    body.email === c.env.OWNER_EMAIL ? 1 : 0, refCode, body.referred_by || null, body.preferred_language || 'en', sanitize(body.notes || '')
+  ).bind(id, body.firebase_uid || null, sanitize(maxLen(body.name, 200)), sanitize(maxLen(body.email || '', 254)), sanitize(maxLen(body.phone || '', 30)), sanitize(maxLen(body.address || '', 500)), sanitize(maxLen(body.city || '', 100)),
+    body.email === c.env.OWNER_EMAIL ? 1 : 0, refCode, body.referred_by || null, maxLen(body.preferred_language || 'en', 10), sanitize(maxLen(body.notes || '', 1000))
   ).run();
   return c.json({ id, referral_code: refCode, is_owner: body.email === c.env.OWNER_EMAIL ? 1 : 0 });
 });
@@ -474,7 +492,7 @@ app.post('/reviews', async (c) => {
   const id = uid();
   await c.env.DB.prepare(
     'INSERT INTO reviews (id, customer_id, job_id, rating, text, photo_url, approved) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, b.customer_id || null, b.job_id || null, rating, sanitize(b.text), b.photo_url || null, 0).run();
+  ).bind(id, b.customer_id || null, b.job_id || null, rating, sanitize(maxLen(b.text, 2000)), b.photo_url ? maxLen(b.photo_url, 500) : null, 0).run();
   return c.json({ id });
 });
 
@@ -536,9 +554,11 @@ app.post('/chat/session', async (c) => {
     }
   }
   const id = uid();
+  const msgs = Array.isArray(b.messages) ? b.messages.slice(-50) : [];
+  const emoLog = Array.isArray(b.emotion_log) ? b.emotion_log.slice(-50) : [];
   await c.env.DB.prepare(
     'INSERT INTO chat_sessions (id, customer_id, messages, emotion_log) VALUES (?, ?, ?, ?)'
-  ).bind(id, b.customer_id || null, JSON.stringify(b.messages || []), JSON.stringify(b.emotion_log || [])).run();
+  ).bind(id, b.customer_id || null, maxLen(JSON.stringify(msgs), 32000), maxLen(JSON.stringify(emoLog), 16000)).run();
   return c.json({ id });
 });
 
@@ -778,7 +798,7 @@ app.post('/nps', async (c) => {
   else action = 'alert_adam';
   await c.env.DB.prepare(
     'INSERT INTO nps_responses (id, customer_id, job_id, score, comment, follow_up_action) VALUES (?, ?, ?, ?, ?, ?)'
-  ).bind(id, b.customer_id || null, b.job_id || null, score, sanitize(b.comment || ''), action).run();
+  ).bind(id, b.customer_id || null, b.job_id || null, score, sanitize(maxLen(b.comment || '', 1000)), action).run();
   return c.json({ id, follow_up_action: action });
 });
 
@@ -1196,20 +1216,20 @@ app.post('/belle/chat', async (c) => {
 
   // Build system prompt + optional brain context
   let systemContent = BELLE_SYSTEM_PROMPT;
-  if (body.context) systemContent += body.context;
+  if (body.context) systemContent += maxLen(body.context, 4000);
 
   // Build messages array (user/assistant only — Claude API takes system separately)
   let messages: Array<{role: string; content: string}> = [];
 
   // Support both formats: {messages: [...]} and {message: "...", history: [...]}
   if (body.messages && body.messages.length) {
-    const nonSystem = body.messages.filter((m: any) => m.role !== 'system');
-    messages.push(...nonSystem);
+    const nonSystem = body.messages.filter((m: any) => m.role !== 'system').slice(-20);
+    messages.push(...nonSystem.map((m: any) => ({ role: m.role, content: maxLen(m.content, 4000) })));
   } else if (body.message) {
     if (body.history && body.history.length) {
-      messages.push(...body.history);
+      messages.push(...body.history.slice(-20).map((m: any) => ({ role: m.role, content: maxLen(m.content, 4000) })));
     }
-    messages.push({ role: 'user', content: body.message });
+    messages.push({ role: 'user', content: maxLen(body.message, 4000) });
   } else {
     return c.json({ error: 'No message provided' }, 400);
   }
@@ -1248,7 +1268,7 @@ app.post('/belle/vision', async (c) => {
   const body = await c.req.json();
   const imageUrl = body.image_url;
   const imageBase64 = body.image_base64;
-  const prompt = body.prompt || 'Analyze this room photo for a carpentry contractor. Identify: current condition, what work is needed, estimated scope. Be specific about materials and labor.';
+  const prompt = maxLen(body.prompt || 'Analyze this room photo for a carpentry contractor. Identify: current condition, what work is needed, estimated scope. Be specific about materials and labor.', 2000);
 
   if (!imageUrl && !imageBase64) return c.json({ error: 'image_url or image_base64 required' }, 400);
 
@@ -1630,7 +1650,7 @@ app.post('/warranty-claims', async (c) => {
   if (!warranty) return c.json({ error: 'Warranty not found or expired' }, 404);
   await c.env.DB.prepare(
     'INSERT INTO warranty_claims (id, warranty_id, description, photo_urls) VALUES (?,?,?,?)'
-  ).bind(id, b.warranty_id, sanitize(b.description), b.photo_urls || '').run();
+  ).bind(id, b.warranty_id, sanitize(maxLen(b.description, 2000)), maxLen(b.photo_urls || '', 2000)).run();
   return c.json({ ok: true, id }, 201);
 });
 
