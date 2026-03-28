@@ -2477,6 +2477,45 @@ app.post('/booking/request', async (c) => {
     } catch {}
   }
 
+  // Email confirmation to customer if Resend configured and email provided
+  if (c.env.RESEND_API_KEY && b.email) {
+    try {
+      const dateParts = b.date.split('-');
+      const niceDate = new Date(+dateParts[0], +dateParts[1] - 1, +dateParts[2]).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+      const serviceLabels: Record<string, string> = { trim_work: 'Trim Work', crown_molding: 'Crown Molding', baseboards: 'Baseboards', wainscoting: 'Wainscoting', custom_cabinetry: 'Custom Cabinetry', built_in_shelving: 'Built-in Shelving', fireplace_mantels: 'Fireplace Mantels', coffered_ceilings: 'Coffered Ceilings', door_window_casings: 'Door/Window Casings', closet_systems: 'Closet Systems', other: 'Other' };
+      const svcLabel = serviceLabels[b.service_type] || b.service_type;
+      const firstName = (b.name || '').split(' ')[0];
+      await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${c.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: 'Pro Finish Custom Carpentry <bookings@profinishusa.com>',
+          to: [b.email],
+          subject: `Estimate Requested — ${niceDate}`,
+          html: `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:20px">
+            <div style="background:#0D2847;color:#fff;padding:20px;text-align:center;border-radius:8px 8px 0 0">
+              <h1 style="margin:0;font-size:1.3rem">Pro Finish Custom Carpentry</h1>
+            </div>
+            <div style="background:#fff;padding:24px;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 8px 8px">
+              <p style="font-size:1rem;color:#1e293b">Hi ${firstName},</p>
+              <p style="color:#475569">Thank you for requesting an estimate! Here are your details:</p>
+              <table style="width:100%;border-collapse:collapse;margin:16px 0">
+                <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Service</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${svcLabel}</td></tr>
+                <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Date</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${niceDate}</td></tr>
+                ${b.address ? `<tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Address</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${sanitize(b.address)}</td></tr>` : ''}
+                <tr><td style="padding:8px 12px;background:#f8fafc;font-weight:600;color:#0D2847;border:1px solid #e2e8f0">Confirmation #</td><td style="padding:8px 12px;border:1px solid #e2e8f0">${apptId}</td></tr>
+              </table>
+              <p style="color:#475569"><strong>What happens next:</strong> Adam will call or text you to confirm the appointment time. If you need to reschedule, just call <a href="tel:4324665310" style="color:#1B4D8E">(432) 466-5310</a>.</p>
+              <div style="text-align:center;margin-top:20px;padding-top:16px;border-top:1px solid #e2e8f0">
+                <p style="font-size:.85rem;color:#94a3b8">Pro Finish Custom Carpentry &bull; Big Spring, TX &bull; (432) 466-5310</p>
+              </div>
+            </div>
+          </div>`
+        })
+      });
+    } catch {}
+  }
+
   return c.json({ ok: true, appointment_id: apptId, customer_id: customerId, message: 'Booking request received! Adam will confirm your appointment shortly.' });
 });
 
