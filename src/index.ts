@@ -2147,13 +2147,19 @@ app.post('/warranties', async (c) => {
   const denied = requireAuth(c);
   if (denied) return denied;
   const b = await c.req.json();
+  if (!b.job_id || typeof b.job_id !== 'string') return c.json({ error: 'job_id is required' }, 400);
+  if (!b.customer_id || typeof b.customer_id !== 'string') return c.json({ error: 'customer_id is required' }, 400);
+  if (b.start_date && !/^\d{4}-\d{2}-\d{2}$/.test(b.start_date)) return c.json({ error: 'start_date must be YYYY-MM-DD' }, 400);
+  const months = Number(b.duration_months || 12);
+  if (isNaN(months) || months < 1 || months > 120 || !Number.isInteger(months)) return c.json({ error: 'duration_months must be integer 1-120' }, 400);
+  const validTypes = ['workmanship', 'materials', 'structural', 'full'];
+  if (b.type && !validTypes.includes(b.type)) return c.json({ error: 'Invalid warranty type' }, 400);
   const id = uid();
   const startDate = b.start_date || new Date().toISOString().split('T')[0];
-  const months = b.duration_months || 12;
   const endDate = new Date(new Date(startDate).getTime() + months * 30.44 * 86400000).toISOString().split('T')[0];
   await c.env.DB.prepare(
     'INSERT INTO warranties (id, job_id, customer_id, type, duration_months, start_date, end_date, terms, status) VALUES (?,?,?,?,?,?,?,?,?)'
-  ).bind(id, b.job_id, b.customer_id, b.type || 'workmanship', months, startDate, endDate, sanitize(b.terms || '1-year warranty on all workmanship'), 'active').run();
+  ).bind(id, b.job_id, b.customer_id, b.type || 'workmanship', months, startDate, endDate, sanitize(maxLen(b.terms || '1-year warranty on all workmanship', 2000)), 'active').run();
   return c.json({ ok: true, id, end_date: endDate }, 201);
 });
 
@@ -2173,6 +2179,8 @@ app.post('/warranty-claims', async (c) => {
   const ip = c.req.header('cf-connecting-ip') || 'unknown';
   if (!checkRateLimit(ip)) return c.json({ error: 'Too many requests' }, 429);
   const b = await c.req.json();
+  if (!b.warranty_id || typeof b.warranty_id !== 'string') return c.json({ error: 'warranty_id is required' }, 400);
+  if (!b.description || typeof b.description !== 'string' || b.description.trim().length < 10) return c.json({ error: 'description is required (min 10 chars)' }, 400);
   const id = uid();
   // Verify warranty is active
   const warranty = await c.env.DB.prepare('SELECT * FROM warranties WHERE id = ? AND status = "active"').bind(b.warranty_id).first();
@@ -2190,8 +2198,12 @@ app.put('/warranty-claims/:id', async (c) => {
   const b = await c.req.json();
   const sets: string[] = [];
   const vals: any[] = [];
-  if (b.status !== undefined) { sets.push('status = ?'); vals.push(b.status); }
-  if (b.resolution !== undefined) { sets.push('resolution = ?'); vals.push(sanitize(b.resolution)); }
+  const validClaimStatuses = ['pending', 'investigating', 'approved', 'resolved', 'denied'];
+  if (b.status !== undefined) {
+    if (!validClaimStatuses.includes(b.status)) return c.json({ error: 'Invalid claim status' }, 400);
+    sets.push('status = ?'); vals.push(b.status);
+  }
+  if (b.resolution !== undefined) { sets.push('resolution = ?'); vals.push(sanitize(maxLen(b.resolution, 2000))); }
   if (b.status === 'resolved') { sets.push("resolved_at = datetime('now')"); }
   vals.push(id);
   await c.env.DB.prepare(`UPDATE warranty_claims SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run();
