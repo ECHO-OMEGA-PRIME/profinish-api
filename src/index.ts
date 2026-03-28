@@ -1278,6 +1278,26 @@ app.post('/nps', async (c) => {
   await c.env.DB.prepare(
     'INSERT INTO nps_responses (id, customer_id, job_id, score, comment, follow_up_action) VALUES (?, ?, ?, ?, ?, ?)'
   ).bind(id, b.customer_id || null, b.job_id || null, score, sanitize(maxLen(b.comment || '', 1000)), action).run();
+
+  // Execute NPS follow-up action immediately
+  try {
+    if (action === 'alert_adam' && c.env.ADAM_PHONE) {
+      // Detractor (0-6): Alert owner immediately so they can intervene
+      const custName = b.customer_id ? ((await c.env.DB.prepare('SELECT name FROM customers WHERE id = ?').bind(b.customer_id).first()) as any)?.name || 'Unknown' : 'Anonymous';
+      await sendSms(c.env, c.env.DB, c.env.ADAM_PHONE,
+        `⚠ NPS Alert: ${custName} gave a ${score}/10. ${b.comment ? 'Comment: ' + b.comment.slice(0, 100) : 'No comment.'}  Follow up ASAP to recover this customer.`,
+        'nps_alert');
+    } else if (action === 'ask_google_review' && b.customer_id) {
+      // Promoter (9-10): Send Google review request
+      const cust = await c.env.DB.prepare('SELECT phone, email, name FROM customers WHERE id = ?').bind(b.customer_id).first() as any;
+      if (cust?.phone) {
+        await sendSms(c.env, c.env.DB, cust.phone,
+          `Hi ${cust.name?.split(' ')[0] || 'there'}! Thank you for the amazing feedback! Would you share your experience on Google? It really helps: https://g.page/r/profinish-big-spring/review  — Adam, Pro Finish`,
+          'nps_google_review');
+      }
+    }
+  } catch {}
+
   return c.json({ id, follow_up_action: action });
 });
 
@@ -2338,6 +2358,25 @@ app.put('/jobs/:id/advance', async (c) => {
   if (next === 'completed') sets.push("completion_date = date('now')");
   vals.push(id);
   await c.env.DB.prepare(`UPDATE jobs SET ${sets.join(', ')} WHERE id = ?`).bind(...vals).run();
+
+  // When job completes: mark referral as converted + schedule review request follow-up
+  if (next === 'completed') {
+    try {
+      // Mark referral as converted if this customer was referred
+      const cust = await c.env.DB.prepare('SELECT customer_id FROM jobs WHERE id = ?').bind(id).first() as any;
+      if (cust?.customer_id) {
+        await c.env.DB.prepare("UPDATE referrals SET status = 'converted' WHERE referred_id = ? AND status = 'pending'").bind(cust.customer_id).run();
+        // Schedule a review request follow-up 2 days after completion
+        const reviewDate = new Date();
+        reviewDate.setUTCDate(reviewDate.getUTCDate() + 2);
+        await c.env.DB.prepare(
+          'INSERT INTO follow_ups (id, customer_id, job_id, type, step, scheduled_at, channel, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(uid(), cust.customer_id, id, 'review_request', 1, reviewDate.toISOString(), 'sms',
+          'Hi! Adam from Pro Finish here. We just wrapped up your project — hope you love the results! Would you take a minute to leave us a Google review? It helps us a ton: https://g.page/r/profinish-big-spring/review Thanks!').run();
+      }
+    } catch {}
+  }
+
   return c.json({ ok: true, previous: job.status, current: next });
 });
 
@@ -2685,6 +2724,23 @@ app.post('/booking/request', async (c) => {
       'booking_customer');
   }
 
+  // Auto-create follow-up sequence for lead nurturing
+  try {
+    const firstName = (b.name || '').split(' ')[0];
+    // Step 1: Check-in 2 days after booking (did Adam call to confirm?)
+    const day2 = new Date(); day2.setUTCDate(day2.getUTCDate() + 2);
+    await c.env.DB.prepare(
+      'INSERT INTO follow_ups (id, customer_id, job_id, type, step, scheduled_at, channel, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(uid(), customerId, null, 'booking_nurture', 1, day2.toISOString(), 'sms',
+      `Hi ${firstName}! This is Adam from Pro Finish. Just checking in — did we get your estimate visit confirmed? If not, call or text me at (432) 466-5310. Looking forward to seeing your project!`).run();
+    // Step 2: Gentle nudge 5 days after if no job created
+    const day5 = new Date(); day5.setUTCDate(day5.getUTCDate() + 5);
+    await c.env.DB.prepare(
+      'INSERT INTO follow_ups (id, customer_id, job_id, type, step, scheduled_at, channel, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(uid(), customerId, null, 'booking_nurture', 2, day5.toISOString(), 'sms',
+      `Hi ${firstName}, Adam from Pro Finish again. Just wanted to follow up on your ${b.service_type?.replace(/_/g, ' ') || 'carpentry'} project. We'd love to help — any questions I can answer? (432) 466-5310`).run();
+  } catch {}
+
   const confirmationNumber = 'PF-' + apptId.slice(0, 6).toUpperCase();
   return c.json({ ok: true, appointment_id: apptId, confirmation_number: confirmationNumber, customer_id: customerId, message: 'Booking request received! Adam will confirm your appointment shortly.' });
 });
@@ -2719,7 +2775,7 @@ async function handleScheduled(env: Env): Promise<void> {
               c.name as customer_name, c.phone as customer_phone, c.email as customer_email
        FROM appointments a
        LEFT JOIN customers c ON a.customer_id = c.id
-       WHERE a.date = ? AND a.status IN ('scheduled', 'confirmed')`
+       WHERE a.date = ? AND a.status IN ('pending', 'scheduled', 'confirmed')`
     ).bind(tomorrowStr).all();
 
     let smsCount = 0;
